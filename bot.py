@@ -52,11 +52,13 @@ def notify_n8n(pos, event_type, pnl_lot1, pnl_lot2, total_pnl, phase_atteinte, r
 # ── Telegram ────────────────────────────────────────────
 def tg(msg):
     try:
-        req.post(
+        r = req.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
             timeout=5
         )
+        if not r.ok:
+            log.warning(f"Telegram erreur HTTP {r.status_code}: {r.text}")
     except Exception as e:
         log.warning(f"Telegram erreur: {e}")
 
