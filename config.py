@@ -49,6 +49,8 @@ CDV_PERIOD  = 30
 ATR_PERIOD  = 14
 ATR_SL      = 1.2
 ATR_TP1     = 1.8        # TP1 = 1.8x ATR — RR 1:1.5
+MIN_SL_DIST = 0.30       # Distance SL minimale absolue ($)
+MIN_ATR     = 0.40       # ATR minimum ($) — filtre session morte (asiatique 01h-06h UTC)
 
 # ── Runner — même logique que bots existants ────────────
 RUNNER_PCT       = 0.50   # 50% des contrats = Lot 2 (runner)
