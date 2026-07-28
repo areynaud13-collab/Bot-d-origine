@@ -57,7 +57,8 @@ def tg(msg):
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
             timeout=5
         )
-        log.info(f"Telegram response: {r.status_code} {r.text[:200]}")
+        if not r.ok:
+            log.warning(f"Telegram erreur HTTP {r.status_code}: {r.text}")
     except Exception as e:
         log.warning(f"Telegram erreur: {e}")
 
