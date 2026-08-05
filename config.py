@@ -28,10 +28,10 @@ INTERVAL_SIGNAL   = "5m"    # Signal décisionnel
 INTERVAL_CONFIRM  = "1m"    # Confirmation entrée
 INTERVAL_HTF_1H   = "1h"    # Structure + Sweep
 INTERVAL_HTF_4H   = "4h"    # Liquidité + OB + DXY
-CANDLES_5M        = 300     # ~25h historique 5m
+CANDLES_5M        = 290     # ~24h historique 5m (max 300 - marge sécurité)
 CANDLES_1M        = 10      # Confirmation micro
-CANDLES_1H        = 200     # Structure 1h
-CANDLES_4H        = 100     # Liquidité 4h
+CANDLES_1H        = 190     # Structure 1h (190+10=200 — limite Bitget max)
+CANDLES_4H        = 90      # Liquidité 4h (90+10=100 — sous limite Bitget)
 
 # ── Symbole DXY ──────────────────────────────────────────────────
 # Bitget ne propose pas DXY directement
