@@ -26,12 +26,12 @@ OPEN_TYPE = 1  # 1 = Isolated
 # ── Timeframes ───────────────────────────────────────────────────
 INTERVAL_SIGNAL   = "5m"    # Signal décisionnel
 INTERVAL_CONFIRM  = "1m"    # Confirmation entrée
-INTERVAL_HTF_1H   = "1h"    # Structure + Sweep
-INTERVAL_HTF_4H   = "4h"    # Liquidité + OB + DXY
-CANDLES_5M        = 290     # ~24h historique 5m (max 300 - marge sécurité)
+INTERVAL_HTF_1H   = "1H"    # Structure + Sweep (Bitget = majuscule)
+INTERVAL_HTF_4H   = "4H"    # Liquidité + OB + DXY (Bitget = majuscule)
+CANDLES_5M        = 290     # ~24h historique 5m
 CANDLES_1M        = 10      # Confirmation micro
-CANDLES_1H        = 190     # Structure 1h (190+10=200 — limite Bitget max)
-CANDLES_4H        = 90      # Liquidité 4h (90+10=100 — sous limite Bitget)
+CANDLES_1H        = 100     # Structure 1h — suffisant pour 10 bougies lookback
+CANDLES_4H        = 50      # Liquidité 4h — suffisant pour 30 bougies lookback
 
 # ── Symbole DXY ──────────────────────────────────────────────────
 # Bitget ne propose pas DXY directement
