@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════
 # CONFIG V4 — VP+VWAP+Delta+MTF Scalper · XAU/USDT · BITGET
 # Architecture quant institutionnelle · Sans EMA · DXY 4h
-# Capital $2000 · Risque 2% · Marge 30% max · DD 20% max
+# Capital $2000 · Risque 2% · Marge 30% max · DD 15% max
 # ═══════════════════════════════════════════════════════════════════
 
 import os
@@ -30,7 +30,7 @@ INTERVAL_HTF_1H   = "1h"    # Structure + Sweep
 INTERVAL_HTF_4H   = "4h"    # Liquidité + OB + DXY
 CANDLES_5M        = 300     # ~25h historique 5m
 CANDLES_1M        = 10      # Confirmation micro
-CANDLES_1H        = 200     # Structure 1h
+CANDLES_1H        = 190     # Bitget limite 200 bougies max (190+10=200)     # Structure 1h
 CANDLES_4H        = 100     # Liquidité 4h
 
 # ── Symbole DXY ──────────────────────────────────────────────────
