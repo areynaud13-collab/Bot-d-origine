@@ -30,7 +30,7 @@ INTERVAL_HTF_1H   = "1h"    # Structure + Sweep
 INTERVAL_HTF_4H   = "4h"    # Liquidité + OB + DXY
 CANDLES_5M        = 300     # ~25h historique 5m
 CANDLES_1M        = 10      # Confirmation micro
-CANDLES_1H        = 190     # Bitget limite 200 bougies max (190+10=200)     # Structure 1h
+CANDLES_1H        = 90      # Bitget limite 100 bougies max (90+10=100)     # Structure 1h
 CANDLES_4H        = 100     # Liquidité 4h
 
 # ── Symbole DXY ──────────────────────────────────────────────────
