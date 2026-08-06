@@ -96,6 +96,8 @@ def notify_n8n(pos, event_type, pnl_amount, phase, resultat):
             "Capital_Apres":round(state.paper_balance, 2),
             "Duree_min":    duree,
             "DD_Level":     state.dd_level,
+            "WR_Daily":     round(state.daily_wr, 1),
+            "WR_Total":     round(state.wr, 1),
         }
         req.post(N8N_WEBHOOK_URL, json=data, timeout=5)
     except Exception as e:
@@ -119,6 +121,8 @@ class State:
         self.losses          = 0
         self.daily_pnl       = 0.0
         self.daily_trades    = 0
+        self.daily_wins      = 0
+        self.daily_losses    = 0
         self.start_date      = date.today()
         self.contract_size   = 0.01
         self.peak_capital    = float(CAPITAL)
@@ -142,12 +146,19 @@ class State:
             log.info(f"Nouveau jour | P&L hier: {self.daily_pnl:+.2f}$")
             self.daily_pnl    = 0.0
             self.daily_trades = 0
+            self.daily_wins   = 0
+            self.daily_losses = 0
             self.start_date   = date.today()
 
     @property
     def wr(self):
         t = self.wins + self.losses
         return self.wins / t * 100 if t > 0 else 0.0
+
+    @property
+    def daily_wr(self):
+        t = self.daily_wins + self.daily_losses
+        return self.daily_wins / t * 100 if t > 0 else 0.0
 
     @property
     def capital(self):
@@ -473,6 +484,7 @@ def check_exits(current_price, last_1m_candle):
             state.paper_pnl     += pnl
             state.daily_pnl     += pnl
             state.losses        += 1
+            state.daily_losses  += 1
             state.total_trades  += 1
             state.daily_trades  += 1
             state.consec_losses += 1
@@ -527,6 +539,7 @@ def check_exits(current_price, last_1m_candle):
             state.paper_pnl     += pnl_lot2
             state.daily_pnl     += pnl_lot2
             state.wins          += 1  # TP1 atteint = WIN global
+            state.daily_wins    += 1
             state.total_trades  += 1
             state.daily_trades  += 1
             state.position       = None
@@ -548,6 +561,7 @@ def check_exits(current_price, last_1m_candle):
             state.paper_pnl     += pnl_lot2
             state.daily_pnl     += pnl_lot2
             state.wins          += 1
+            state.daily_wins    += 1
             state.total_trades  += 1
             state.daily_trades  += 1
             state.position       = None
