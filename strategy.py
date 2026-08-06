@@ -97,14 +97,50 @@ def calc_delta_volume(closes, opens, volumes, period):
     return bias, prev_bias
 
 
-def calc_vwap_session(highs, lows, closes, volumes):
-    """VWAP journalier + bandes ±2SD."""
+def calc_vwap_session(highs, lows, closes, volumes, timestamps=None):
+    """
+    VWAP institutionnel avec reset par session de trading.
+
+    3 sessions par jour (méthode desks or institutionnels) :
+    ┌─────────────────────────────────────────────────────┐
+    │ Session 1 Asie    : reset 00h00 UTC                 │
+    │ Session 2 Londres : reset 07h00 UTC                 │
+    │ Session 3 New York: reset 13h30 UTC                 │
+    └─────────────────────────────────────────────────────┘
+
+    Chaque session a son propre VWAP et ses propres bandes ±2SD.
+    Les bandes sont fiables et exploitables dès 30-45min après
+    l'ouverture de chaque session.
+
+    Si timestamps non fournis → cumulatif (compatibilité backtest).
+    """
+    def get_session_id(dt_utc):
+        h = dt_utc.hour; m = dt_utc.minute
+        total_min = h * 60 + m
+        if total_min >= 13 * 60 + 30:
+            session = 2
+        elif total_min >= 7 * 60:
+            session = 1
+        else:
+            session = 0
+        return (dt_utc.date(), session)
+
     n = len(closes)
     result = [None] * n
     cum_vol = 0.0; cum_tpv = 0.0; cum_tp2v = 0.0
+    prev_session = None
+
     for i in range(n):
+        if timestamps is not None:
+            dt = datetime.fromtimestamp(timestamps[i], tz=timezone.utc)
+            current_session = get_session_id(dt)
+            if prev_session is not None and current_session != prev_session:
+                cum_vol = 0.0; cum_tpv = 0.0; cum_tp2v = 0.0
+            prev_session = current_session
+
         tp = (highs[i] + lows[i] + closes[i]) / 3.0
-        cum_vol += volumes[i]; cum_tpv += tp * volumes[i]
+        cum_vol  += volumes[i]
+        cum_tpv  += tp * volumes[i]
         cum_tp2v += tp * tp * volumes[i]
         if cum_vol < 1e-9: continue
         vwap = cum_tpv / cum_vol
@@ -513,7 +549,8 @@ def calc_signal(candles_5m, candles_1m,
     bias      = bias_arr[i]
     prev_bias = prev_bias_arr[i]
 
-    vwap_arr = calc_vwap_session(highs, lows, closes, volumes)
+    timestamps = [c.get("timestamp", 0) for c in candles_5m]
+    vwap_arr = calc_vwap_session(highs, lows, closes, volumes, timestamps)
     vw       = vwap_arr[i]
 
     vp = calc_volume_profile(highs, lows, closes, volumes,
