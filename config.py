@@ -73,6 +73,7 @@ VWAP_SLOPE_PERIOD   = 10    # Pente sur 10 dernières bougies VWAP
 VWAP_SLOPE_BULL     = 0.3   # VWAP monte > 0.3$/bougie → régime BULL
 VWAP_SLOPE_BEAR     = -0.3  # VWAP descend < -0.3$/bougie → régime BEAR
 VWAP_ADX_TREND      = 22    # ADX minimum pour confirmer régime tendanciel
+VWAP_REGIME_BONUS   = 0.5   # Bonus score sur setups dans le sens du régime TREND
 # En dessous de VWAP_ADX_TREND OU avant VWAP_WARMUP_CANDLES → RANGE pur
 
 # ── Delta Volume ─────────────────────────────────────────────────
