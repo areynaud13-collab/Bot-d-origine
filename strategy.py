@@ -646,14 +646,24 @@ def calc_signal(candles_5m, candles_1m,
 
     # ── Filtre régime VWAP de session ────────────────────────────
     # Détecte la tendance de session via pente VWAP + ADX
-    # TREND_BULL → bloque SHORT counter-trend (sauf sd2up extrême)
-    # TREND_BEAR → bloque LONG counter-trend (sauf sd2dn extrême)
-    # RANGE      → aucun blocage — comportement mean-reversion pur
+    # PAS de filtre dur — uniquement bonus/malus sur le score minimum
+    # TREND_BULL → malus score sur SHORT counter-trend (+0.5 sur ms)
+    # TREND_BEAR → malus score sur LONG counter-trend (+0.5 sur ms)
+    # RANGE      → aucun ajustement
     regime = detect_regime(vwap_arr, ax, i)
-    if regime == "TREND_BULL":
-        short_ok = short_ok and sd2up   # SHORT uniquement sur épuisement ±2SD
-    elif regime == "TREND_BEAR":
-        long_ok  = long_ok  and sd2dn   # LONG uniquement sur épuisement ±2SD
+
+    # ── ADX + Régime — ajustement ms_base directionnel ───────────
+    # En tendance forte (ADX > 35) : faciliter les trades dans le sens
+    # de la tendance et maintenir le seuil élevé pour les counter-trend
+    if ax > 35 and regime == "TREND_BULL":
+        ms_base_long  = 3.0   # LONG plus facile en trend haussier fort
+        ms_base_short = 4.0   # SHORT plus difficile en trend haussier fort
+    elif ax > 35 and regime == "TREND_BEAR":
+        ms_base_long  = 4.0   # LONG plus difficile en trend baissier fort
+        ms_base_short = 3.0   # SHORT plus facile en trend baissier fort
+    else:
+        ms_base_long  = ms_base   # Range ou transition → comportement inchangé
+        ms_base_short = ms_base
 
     # ── Helper calcul score commun ────────────────────────────────
     def base_score_long(near_level):
@@ -668,8 +678,11 @@ def calc_signal(candles_5m, candles_1m,
         if ob_ctx and ob_in_zone(price, at, ob_ctx, "long"): sc += OB_BONUS
         # DXY corrélation
         if DXY_ENABLED:
-            if dxy_struct == "BEARISH":   sc += DXY_BONUS   # dollar faible = bon LONG or
-            elif dxy_struct == "BULLISH": sc -= DXY_MALUS   # dollar fort = mauvais LONG or
+            if dxy_struct == "BEARISH":   sc += DXY_BONUS
+            elif dxy_struct == "BULLISH": sc -= DXY_MALUS
+        # Régime VWAP — bonus dans le sens + malus counter-trend
+        if regime == "TREND_BULL":        sc += VWAP_REGIME_BONUS
+        elif regime == "TREND_BEAR":      sc -= VWAP_REGIME_BONUS
         return sc
 
     def base_score_short(near_level):
@@ -684,8 +697,11 @@ def calc_signal(candles_5m, candles_1m,
         if ob_ctx and ob_in_zone(price, at, ob_ctx, "short"): sc += OB_BONUS
         # DXY corrélation
         if DXY_ENABLED:
-            if dxy_struct == "BULLISH":    sc += DXY_BONUS   # dollar fort = bon SHORT or
-            elif dxy_struct == "BEARISH":  sc -= DXY_MALUS   # dollar faible = mauvais SHORT or
+            if dxy_struct == "BULLISH":    sc += DXY_BONUS
+            elif dxy_struct == "BEARISH":  sc -= DXY_MALUS
+        # Régime VWAP — bonus dans le sens + malus counter-trend
+        if regime == "TREND_BEAR":         sc += VWAP_REGIME_BONUS
+        elif regime == "TREND_BULL":       sc -= VWAP_REGIME_BONUS
         return sc
 
     def build_signal(side, setup, sl, tp1, tp2, score, tags):
@@ -738,7 +754,7 @@ def calc_signal(candles_5m, candles_1m,
     # SETUPS LONG
     # ════════════════════════════════════════════════════
     if long_ok:
-        ms = ms_base - 0.5 if sd2dn else ms_base
+        ms = ms_base_long - 0.5 if sd2dn else ms_base_long
 
         # L1 : VAL → POC
         if (abs(price - val) < tol * 1.5 and poc > price and
@@ -783,7 +799,7 @@ def calc_signal(candles_5m, candles_1m,
     # SETUPS SHORT
     # ════════════════════════════════════════════════════
     if short_ok:
-        ms = ms_base - 0.5 if sd2up else ms_base
+        ms = ms_base_short - 0.5 if sd2up else ms_base_short
 
         # S1 : VAH → POC
         if (abs(price - vah) < tol * 1.5 and poc < price and
