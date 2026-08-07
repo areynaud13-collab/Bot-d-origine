@@ -26,11 +26,11 @@ OPEN_TYPE = 1  # 1 = Isolated
 # ── Timeframes ───────────────────────────────────────────────────
 INTERVAL_SIGNAL   = "5m"    # Signal décisionnel
 INTERVAL_CONFIRM  = "1m"    # Confirmation entrée
-INTERVAL_HTF_1H   = "1h"    # Structure + Sweep
-INTERVAL_HTF_4H   = "4h"    # Liquidité + OB + DXY
+INTERVAL_HTF_1H   = "1H"    # Structure + Sweep (MAJUSCULE Bitget)
+INTERVAL_HTF_4H   = "4H"    # Liquidité + OB + DXY (MAJUSCULE Bitget)
 CANDLES_5M        = 300     # ~25h historique 5m
 CANDLES_1M        = 10      # Confirmation micro
-CANDLES_1H        = 200     # Structure 1h
+CANDLES_1H        = 90      # Bitget limite 100 bougies max (90+10=100)
 CANDLES_4H        = 100     # Liquidité 4h
 
 # ── Symbole DXY ──────────────────────────────────────────────────
