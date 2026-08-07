@@ -154,43 +154,25 @@ def calc_vwap_session(highs, lows, closes, volumes, timestamps=None):
     return result
 
 
-def detect_regime(vwap_arr, adx, i):
+def detect_regime(vwap_arr, adx, i, warmup=9, slope_period=10,
+                  slope_bull=0.3, slope_bear=-0.3, adx_min=22):
     """
-    Détecte le régime de marché de la session courante.
-
-    TREND_BULL : VWAP en pente haussière + ADX confirmé + après warmup session
-    TREND_BEAR : VWAP en pente baissière + ADX confirmé + après warmup session
-    RANGE      : sinon (ADX faible, VWAP plat, ou trop tôt après reset session)
-
-    Aligné sur les resets de session VWAP (00h00 / 07h00 / 13h30 UTC).
-    Le VWAP n'est pas fiable dans les 45 premières minutes après un reset.
+    Détecte le régime de session via pente VWAP + ADX.
+    Retourne TREND_BULL, TREND_BEAR ou RANGE.
+    Utilisé uniquement pour les setups de continuation TF1/TF2.
     """
-    # Warmup : il faut au moins VWAP_WARMUP_CANDLES bougies valides depuis le reset
-    # On cherche les dernières VWAP_WARMUP_CANDLES valeurs non None
-    valid_vwap = [(j, vwap_arr[j]) for j in range(max(0, i - VWAP_SLOPE_PERIOD * 2), i + 1)
-                  if vwap_arr[j] is not None]
-
-    if len(valid_vwap) < VWAP_WARMUP_CANDLES:
-        return "RANGE"  # Trop tôt après reset session — pas fiable
-
-    # ADX minimum pour confirmer tendance
-    if adx is None or adx < VWAP_ADX_TREND:
+    valid = [(j, vwap_arr[j]) for j in range(max(0, i - slope_period*2), i+1)
+             if vwap_arr[j] is not None]
+    if len(valid) < warmup or adx is None or adx < adx_min:
         return "RANGE"
-
-    # Pente VWAP sur les VWAP_SLOPE_PERIOD dernières bougies valides
-    recent = valid_vwap[-VWAP_SLOPE_PERIOD:]
+    recent = valid[-slope_period:]
     if len(recent) < 2:
         return "RANGE"
-
-    vwap_values = [v["vwap"] for _, v in recent]
-    slope = (vwap_values[-1] - vwap_values[0]) / len(vwap_values)
-
-    if slope >= VWAP_SLOPE_BULL:
-        return "TREND_BULL"
-    elif slope <= VWAP_SLOPE_BEAR:
-        return "TREND_BEAR"
-    else:
-        return "RANGE"
+    vals = [v["vwap"] for _, v in recent]
+    slope = (vals[-1] - vals[0]) / len(vals)
+    if slope >= slope_bull:  return "TREND_BULL"
+    if slope <= slope_bear:  return "TREND_BEAR"
+    return "RANGE"
 
 
 def calc_volume_profile(highs, lows, closes, volumes, lookback, bins, value_pct):
@@ -644,27 +626,6 @@ def calc_signal(candles_5m, candles_1m,
     long_ok  = (struct == "BULLISH" or struct == "NEUTRAL" or sd2dn)
     short_ok = (struct == "BEARISH" or struct == "NEUTRAL" or sd2up)
 
-    # ── Filtre régime VWAP de session ────────────────────────────
-    # Détecte la tendance de session via pente VWAP + ADX
-    # PAS de filtre dur — uniquement bonus/malus sur le score minimum
-    # TREND_BULL → malus score sur SHORT counter-trend (+0.5 sur ms)
-    # TREND_BEAR → malus score sur LONG counter-trend (+0.5 sur ms)
-    # RANGE      → aucun ajustement
-    regime = detect_regime(vwap_arr, ax, i)
-
-    # ── ADX + Régime — ajustement ms_base directionnel ───────────
-    # En tendance forte (ADX > 35) : faciliter les trades dans le sens
-    # de la tendance et maintenir le seuil élevé pour les counter-trend
-    if ax > 35 and regime == "TREND_BULL":
-        ms_base_long  = 3.0   # LONG plus facile en trend haussier fort
-        ms_base_short = 4.0   # SHORT plus difficile en trend haussier fort
-    elif ax > 35 and regime == "TREND_BEAR":
-        ms_base_long  = 4.0   # LONG plus difficile en trend baissier fort
-        ms_base_short = 3.0   # SHORT plus facile en trend baissier fort
-    else:
-        ms_base_long  = ms_base   # Range ou transition → comportement inchangé
-        ms_base_short = ms_base
-
     # ── Helper calcul score commun ────────────────────────────────
     def base_score_long(near_level):
         sc = near_level
@@ -678,11 +639,8 @@ def calc_signal(candles_5m, candles_1m,
         if ob_ctx and ob_in_zone(price, at, ob_ctx, "long"): sc += OB_BONUS
         # DXY corrélation
         if DXY_ENABLED:
-            if dxy_struct == "BEARISH":   sc += DXY_BONUS
-            elif dxy_struct == "BULLISH": sc -= DXY_MALUS
-        # Régime VWAP — bonus dans le sens + malus counter-trend
-        if regime == "TREND_BULL":        sc += VWAP_REGIME_BONUS
-        elif regime == "TREND_BEAR":      sc -= VWAP_REGIME_BONUS
+            if dxy_struct == "BEARISH":   sc += DXY_BONUS   # dollar faible = bon LONG or
+            elif dxy_struct == "BULLISH": sc -= DXY_MALUS   # dollar fort = mauvais LONG or
         return sc
 
     def base_score_short(near_level):
@@ -697,11 +655,8 @@ def calc_signal(candles_5m, candles_1m,
         if ob_ctx and ob_in_zone(price, at, ob_ctx, "short"): sc += OB_BONUS
         # DXY corrélation
         if DXY_ENABLED:
-            if dxy_struct == "BULLISH":    sc += DXY_BONUS
-            elif dxy_struct == "BEARISH":  sc -= DXY_MALUS
-        # Régime VWAP — bonus dans le sens + malus counter-trend
-        if regime == "TREND_BEAR":         sc += VWAP_REGIME_BONUS
-        elif regime == "TREND_BULL":       sc -= VWAP_REGIME_BONUS
+            if dxy_struct == "BULLISH":    sc += DXY_BONUS   # dollar fort = bon SHORT or
+            elif dxy_struct == "BEARISH":  sc -= DXY_MALUS   # dollar faible = mauvais SHORT or
         return sc
 
     def build_signal(side, setup, sl, tp1, tp2, score, tags):
@@ -754,7 +709,7 @@ def calc_signal(candles_5m, candles_1m,
     # SETUPS LONG
     # ════════════════════════════════════════════════════
     if long_ok:
-        ms = ms_base_long - 0.5 if sd2dn else ms_base_long
+        ms = ms_base - 0.5 if sd2dn else ms_base
 
         # L1 : VAL → POC
         if (abs(price - val) < tol * 1.5 and poc > price and
@@ -799,7 +754,7 @@ def calc_signal(candles_5m, candles_1m,
     # SETUPS SHORT
     # ════════════════════════════════════════════════════
     if short_ok:
-        ms = ms_base_short - 0.5 if sd2up else ms_base_short
+        ms = ms_base - 0.5 if sd2up else ms_base
 
         # S1 : VAH → POC
         if (abs(price - vah) < tol * 1.5 and poc < price and
@@ -839,6 +794,82 @@ def calc_signal(candles_5m, candles_1m,
                 sig = build_signal("short", "VWAP+2SD", sl_p, tp1, tp2, sc,
                                    ["@2SD", "ΔExhaust"])
                 if sig: return sig
+
+    # ════════════════════════════════════════════════════
+    # SETUPS CONTINUATION DE TENDANCE (additifs)
+    # TF1 : Pullback VWAP central | TF2 : Retest POC
+    # Déclenchés uniquement si aucun setup VP/VWAP±2SD validé
+    # ════════════════════════════════════════════════════
+    regime = detect_regime(vwap_arr, ax, i,
+                           adx_min=TF_ADX_MIN_TREND)
+
+    if regime != "RANGE" and vw:
+        vwap_c = vw["vwap"]
+        tol_vwap = at * TF_VWAP_TOL
+
+        # ── TF1 : Pullback VWAP central LONG ─────────────────
+        # Régime TREND_BULL + prix revient sur VWAP + delta épuisé baissier
+        if (regime == "TREND_BULL" and
+                abs(price - vwap_c) < tol_vwap and
+                price > vwap_c - tol_vwap and
+                bias is not None and prev_bias is not None and
+                prev_bias < -TF_DELTA_EXHAUST and bias > prev_bias + 0.10):
+            sl_p = round(vwap_c - at * ATR_SL * 0.8, 2)
+            rrd  = calc_rr_dynamique(at, avg_at, ax, hour, "TF1-VWAP-LONG")
+            tp1  = round(price + abs(price - sl_p) * ATR_TP1, 2)
+            tp2  = round(price + abs(price - sl_p) * rrd, 2)
+            sc   = base_score_long(2.5)
+            if sc >= ms_base:
+                sig = build_signal("long", "TF1-VWAP", sl_p, tp1, tp2, sc,
+                                   ["@VWAP", "TREND_BULL", f"ADX{ax:.0f}"])
+                if sig: return sig
+
+        # ── TF1 : Pullback VWAP central SHORT ────────────────
+        # Régime TREND_BEAR + prix revient sur VWAP + delta épuisé haussier
+        if (regime == "TREND_BEAR" and
+                abs(price - vwap_c) < tol_vwap and
+                price < vwap_c + tol_vwap and
+                bias is not None and prev_bias is not None and
+                prev_bias > TF_DELTA_EXHAUST and bias < prev_bias - 0.10):
+            sl_p = round(vwap_c + at * ATR_SL * 0.8, 2)
+            rrd  = calc_rr_dynamique(at, avg_at, ax, hour, "TF1-VWAP-SHORT")
+            tp1  = round(price - abs(sl_p - price) * ATR_TP1, 2)
+            tp2  = round(price - abs(sl_p - price) * rrd, 2)
+            sc   = base_score_short(2.5)
+            if sc >= ms_base:
+                sig = build_signal("short", "TF1-VWAP", sl_p, tp1, tp2, sc,
+                                   ["@VWAP", "TREND_BEAR", f"ADX{ax:.0f}"])
+                if sig: return sig
+
+    # ── TF2 : Retest POC en support LONG ─────────────────────
+    # Structure 1h BULLISH + ADX > 25 + prix reteste POC par le dessus + delta positif
+    if (struct == "BULLISH" and ax >= TF_ADX_MIN_RETEST and
+            price > poc and abs(price - poc) < tol * 1.2 and
+            delta_bull):
+        sl_p = round(poc - at * ATR_SL, 2)
+        rrd  = calc_rr_dynamique(at, avg_at, ax, hour, "TF2-POC-LONG")
+        tp1  = round(price + abs(price - sl_p) * ATR_TP1, 2)
+        tp2  = round(price + abs(price - sl_p) * rrd, 2)
+        sc   = base_score_long(2.5)
+        if sc >= ms_base:
+            sig = build_signal("long", "TF2-POC", sl_p, tp1, tp2, sc,
+                               ["@POC-RETEST", "BULL", f"ADX{ax:.0f}"])
+            if sig: return sig
+
+    # ── TF2 : Retest POC en résistance SHORT ─────────────────
+    # Structure 1h BEARISH + ADX > 25 + prix reteste POC par le dessous + delta négatif
+    if (struct == "BEARISH" and ax >= TF_ADX_MIN_RETEST and
+            price < poc and abs(price - poc) < tol * 1.2 and
+            delta_bear):
+        sl_p = round(poc + at * ATR_SL, 2)
+        rrd  = calc_rr_dynamique(at, avg_at, ax, hour, "TF2-POC-SHORT")
+        tp1  = round(price - abs(sl_p - price) * ATR_TP1, 2)
+        tp2  = round(price - abs(sl_p - price) * rrd, 2)
+        sc   = base_score_short(2.5)
+        if sc >= ms_base:
+            sig = build_signal("short", "TF2-POC", sl_p, tp1, tp2, sc,
+                               ["@POC-RETEST", "BEAR", f"ADX{ax:.0f}"])
+            if sig: return sig
 
     # ── Pas de setup ─────────────────────────────────────────────
     vw_str  = f"VWAP:{vw['vwap']:.1f}" if vw else "VWAP:N/A"
