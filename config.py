@@ -20,18 +20,18 @@ N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "")
 
 # ── Futures ──────────────────────────────────────────────────────
 SYMBOL    = "XAUUSDT"
-LEVERAGE  = 20
+LEVERAGE  = 20    # Levier paper Bitget
 OPEN_TYPE = 1  # 1 = Isolated
 
 # ── Timeframes ───────────────────────────────────────────────────
 INTERVAL_SIGNAL   = "5m"    # Signal décisionnel
 INTERVAL_CONFIRM  = "1m"    # Confirmation entrée
-INTERVAL_HTF_1H   = "1H"    # Structure + Sweep (Bitget = majuscule)
-INTERVAL_HTF_4H   = "4H"    # Liquidité + OB + DXY (Bitget = majuscule)
-CANDLES_5M        = 290     # ~24h historique 5m
+INTERVAL_HTF_1H   = "1h"    # Structure + Sweep
+INTERVAL_HTF_4H   = "4h"    # Liquidité + OB + DXY
+CANDLES_5M        = 300     # ~25h historique 5m
 CANDLES_1M        = 10      # Confirmation micro
-CANDLES_1H        = 100     # Structure 1h — suffisant pour 10 bougies lookback
-CANDLES_4H        = 50      # Liquidité 4h — suffisant pour 30 bougies lookback
+CANDLES_1H        = 200     # Structure 1h
+CANDLES_4H        = 100     # Liquidité 4h
 
 # ── Symbole DXY ──────────────────────────────────────────────────
 # Bitget ne propose pas DXY directement
@@ -64,6 +64,16 @@ TOL_MULT    = 0.6           # Tolérance autour niveaux VP (× ATR)
 
 # ── VWAP ─────────────────────────────────────────────────────────
 VWAP_RESET_UTC = 0
+
+# ── VWAP Régime — détection tendance de session ──────────────────
+# Aligné sur les resets de session (Asie 00h00 / Londres 07h00 / NY 13h30)
+# Pas de filtre directionnel avant 45 min après reset (VWAP pas fiable)
+VWAP_WARMUP_CANDLES = 9     # 9 × 5m = 45 min — VWAP fiable après ce seuil
+VWAP_SLOPE_PERIOD   = 10    # Pente sur 10 dernières bougies VWAP
+VWAP_SLOPE_BULL     = 0.3   # VWAP monte > 0.3$/bougie → régime BULL
+VWAP_SLOPE_BEAR     = -0.3  # VWAP descend < -0.3$/bougie → régime BEAR
+VWAP_ADX_TREND      = 22    # ADX minimum pour confirmer régime tendanciel
+# En dessous de VWAP_ADX_TREND OU avant VWAP_WARMUP_CANDLES → RANGE pur
 
 # ── Delta Volume ─────────────────────────────────────────────────
 DELTA_PERIOD     = 20
