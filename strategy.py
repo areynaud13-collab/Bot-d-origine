@@ -154,6 +154,45 @@ def calc_vwap_session(highs, lows, closes, volumes, timestamps=None):
     return result
 
 
+def detect_regime(vwap_arr, adx, i):
+    """
+    Détecte le régime de marché de la session courante.
+
+    TREND_BULL : VWAP en pente haussière + ADX confirmé + après warmup session
+    TREND_BEAR : VWAP en pente baissière + ADX confirmé + après warmup session
+    RANGE      : sinon (ADX faible, VWAP plat, ou trop tôt après reset session)
+
+    Aligné sur les resets de session VWAP (00h00 / 07h00 / 13h30 UTC).
+    Le VWAP n'est pas fiable dans les 45 premières minutes après un reset.
+    """
+    # Warmup : il faut au moins VWAP_WARMUP_CANDLES bougies valides depuis le reset
+    # On cherche les dernières VWAP_WARMUP_CANDLES valeurs non None
+    valid_vwap = [(j, vwap_arr[j]) for j in range(max(0, i - VWAP_SLOPE_PERIOD * 2), i + 1)
+                  if vwap_arr[j] is not None]
+
+    if len(valid_vwap) < VWAP_WARMUP_CANDLES:
+        return "RANGE"  # Trop tôt après reset session — pas fiable
+
+    # ADX minimum pour confirmer tendance
+    if adx is None or adx < VWAP_ADX_TREND:
+        return "RANGE"
+
+    # Pente VWAP sur les VWAP_SLOPE_PERIOD dernières bougies valides
+    recent = valid_vwap[-VWAP_SLOPE_PERIOD:]
+    if len(recent) < 2:
+        return "RANGE"
+
+    vwap_values = [v["vwap"] for _, v in recent]
+    slope = (vwap_values[-1] - vwap_values[0]) / len(vwap_values)
+
+    if slope >= VWAP_SLOPE_BULL:
+        return "TREND_BULL"
+    elif slope <= VWAP_SLOPE_BEAR:
+        return "TREND_BEAR"
+    else:
+        return "RANGE"
+
+
 def calc_volume_profile(highs, lows, closes, volumes, lookback, bins, value_pct):
     """Volume Profile institutionnel — POC, VAH, VAL."""
     if len(closes) < lookback:
@@ -604,6 +643,17 @@ def calc_signal(candles_5m, candles_1m,
     # ── Gate directionnelle — Structure 1h (remplace EMA) ────────
     long_ok  = (struct == "BULLISH" or struct == "NEUTRAL" or sd2dn)
     short_ok = (struct == "BEARISH" or struct == "NEUTRAL" or sd2up)
+
+    # ── Filtre régime VWAP de session ────────────────────────────
+    # Détecte la tendance de session via pente VWAP + ADX
+    # TREND_BULL → bloque SHORT counter-trend (sauf sd2up extrême)
+    # TREND_BEAR → bloque LONG counter-trend (sauf sd2dn extrême)
+    # RANGE      → aucun blocage — comportement mean-reversion pur
+    regime = detect_regime(vwap_arr, ax, i)
+    if regime == "TREND_BULL":
+        short_ok = short_ok and sd2up   # SHORT uniquement sur épuisement ±2SD
+    elif regime == "TREND_BEAR":
+        long_ok  = long_ok  and sd2dn   # LONG uniquement sur épuisement ±2SD
 
     # ── Helper calcul score commun ────────────────────────────────
     def base_score_long(near_level):
