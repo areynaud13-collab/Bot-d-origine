@@ -550,6 +550,41 @@ def build_session_vp_context(candles_5m):
         "previous_bars": len(previous_candles),
     }
 
+def build_multi_vp_context(candles_5m):
+    """
+    Agrège les 3 contextes Volume Profile :
+
+    1. Daily VP
+    2. Fixed 4H VP
+    3. Session VP
+
+    Cette couche centralise uniquement l'information.
+    Elle n'influence pas encore le score ni les signaux.
+    """
+    if not candles_5m:
+        return None
+
+    daily_ctx = build_daily_vp_context(candles_5m)
+    h4_ctx = build_fixed_4h_vp_context(candles_5m)
+    session_ctx = build_session_vp_context(candles_5m)
+
+    available = {
+        "daily": daily_ctx is not None,
+        "h4": h4_ctx is not None,
+        "session": session_ctx is not None,
+    }
+
+    available_count = sum(available.values())
+
+    return {
+        "daily": daily_ctx,
+        "h4": h4_ctx,
+        "session": session_ctx,
+        "available": available,
+        "available_count": available_count,
+        "complete": available_count == 3,
+    }
+
 
 # ════════════════════════════════════════════════════════
 # RR DYNAMIQUE
