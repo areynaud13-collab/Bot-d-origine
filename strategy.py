@@ -207,6 +207,34 @@ def calc_volume_profile(highs, lows, closes, volumes, lookback, bins, value_pct)
     }
 
 
+def classify_vp_direction(current_vp, previous_vp):
+    """
+    Classe la migration de valeur d'un Volume Profile.
+
+    BULLISH  : POC, VAH et VAL montent ensemble.
+    BEARISH  : POC, VAH et VAL baissent ensemble.
+    BALANCED : configuration mixte ou données insuffisantes.
+    """
+    if current_vp is None or previous_vp is None:
+        return "BALANCED"
+
+    poc_up = current_vp["poc"] > previous_vp["poc"]
+    vah_up = current_vp["vah"] > previous_vp["vah"]
+    val_up = current_vp["val"] > previous_vp["val"]
+
+    poc_dn = current_vp["poc"] < previous_vp["poc"]
+    vah_dn = current_vp["vah"] < previous_vp["vah"]
+    val_dn = current_vp["val"] < previous_vp["val"]
+
+    if poc_up and vah_up and val_up:
+        return "BULLISH"
+
+    if poc_dn and vah_dn and val_dn:
+        return "BEARISH"
+
+    return "BALANCED"
+
+
 # ════════════════════════════════════════════════════════
 # RR DYNAMIQUE
 # ════════════════════════════════════════════════════════
