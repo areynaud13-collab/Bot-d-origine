@@ -308,6 +308,116 @@ def build_daily_vp_context(candles_5m):
     }
 
 
+def build_fixed_4h_vp_context(candles_5m):
+    """
+    Construit les Volume Profiles 4H fixes UTC.
+
+    Blocs :
+    00h-04h
+    04h-08h
+    08h-12h
+    12h-16h
+    16h-20h
+    20h-00h
+
+    Direction 4H :
+    comparaison des 2 derniers blocs 4H TERMINES.
+
+    Le bloc 4H actuel (developing) sert uniquement
+    à la localisation et n'influence pas encore la direction.
+    """
+    if not candles_5m:
+        return None
+
+    blocks = {}
+
+    # Regrouper chaque bougie dans son bloc 4H fixe UTC
+    for candle in candles_5m:
+        ts = candle.get("timestamp", 0)
+        if not ts:
+            continue
+
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+
+        block_hour = (dt.hour // 4) * 4
+        block_start = dt.replace(
+            hour=block_hour,
+            minute=0,
+            second=0,
+            microsecond=0
+        )
+
+        blocks.setdefault(block_start, []).append(candle)
+
+    if len(blocks) < 3:
+        return None
+
+    sorted_blocks = sorted(blocks.keys())
+
+    # Dernier bloc = bloc 4H actuellement en construction
+    current_block = sorted_blocks[-1]
+
+    # Les deux précédents sont des blocs 4H terminés
+    completed_blocks = sorted_blocks[:-1]
+
+    if len(completed_blocks) < 2:
+        return None
+
+    previous_block = completed_blocks[-1]
+    prior_block = completed_blocks[-2]
+
+    current_candles = blocks[current_block]
+    previous_candles = blocks[previous_block]
+    prior_candles = blocks[prior_block]
+
+    def make_vp(candles):
+        if len(candles) < 12:
+            return None
+
+        highs = [c["high"] for c in candles]
+        lows = [c["low"] for c in candles]
+        closes = [c["close"] for c in candles]
+        volumes = [c["volume"] for c in candles]
+
+        return calc_volume_profile(
+            highs,
+            lows,
+            closes,
+            volumes,
+            len(candles),
+            VP_BINS,
+            VALUE_PCT
+        )
+
+    current_vp = make_vp(current_candles)
+    previous_vp = make_vp(previous_candles)
+    prior_vp = make_vp(prior_candles)
+
+    if previous_vp is None or prior_vp is None:
+        return None
+
+    # Direction basée UNIQUEMENT sur 2 blocs terminés
+    direction = classify_vp_direction(
+        previous_vp,
+        prior_vp
+    )
+
+    maturity = min(len(current_candles) / 48.0, 1.0)
+
+    return {
+        "current": current_vp,
+        "previous": previous_vp,
+        "prior": prior_vp,
+        "direction": direction,
+        "maturity": round(maturity, 2),
+        "current_block": current_block.isoformat(),
+        "previous_block": previous_block.isoformat(),
+        "prior_block": prior_block.isoformat(),
+        "current_bars": len(current_candles),
+        "previous_bars": len(previous_candles),
+        "prior_bars": len(prior_candles),
+    }
+
 
 # ════════════════════════════════════════════════════════
 # RR DYNAMIQUE
