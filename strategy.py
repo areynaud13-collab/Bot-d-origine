@@ -1042,6 +1042,10 @@ def calc_signal(candles_5m, candles_1m,
     vwap_arr = calc_vwap_session(highs, lows, closes, volumes, timestamps)
     vw       = vwap_arr[i]
 
+        # ── Contexte Multi Volume Profile ───────────────────────────
+    multi_vp = build_multi_vp_context(candles_5m)
+    multi_vp_score = score_multi_vp_context(multi_vp)                
+
     vp = calc_volume_profile(highs, lows, closes, volumes,
                               VP_LOOKBACK, VP_BINS, VALUE_PCT)
     if vp is None:
@@ -1170,6 +1174,13 @@ def calc_signal(candles_5m, candles_1m,
             "sweep":     "bull" if sweep_bull else ("bear" if sweep_bear else "none"),
             "vwap":      vw["vwap"] if vw else None,
             "delta":     round(bias, 3) if bias else None,
+                        "multi_vp_score": multi_vp_score["score"] if multi_vp_score else None,
+            "multi_vp_bias": multi_vp_score["bias"] if multi_vp_score else "N/A",
+            "vp_daily_score": multi_vp_score["daily_score"] if multi_vp_score else None,
+            "vp_4h_score": multi_vp_score["h4_score"] if multi_vp_score else None,
+            "vp_session_score": multi_vp_score["session_score"] if multi_vp_score else None,
+            "vp_daily_maturity": multi_vp_score["daily_maturity"] if multi_vp_score else None,
+            "vp_session_maturity": multi_vp_score["session_maturity"] if multi_vp_score else None,
             "reason":    f"{setup} | score={score:.1f} | {' '.join(tags)}",
         }
 
