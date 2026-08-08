@@ -235,6 +235,80 @@ def classify_vp_direction(current_vp, previous_vp):
     return "BALANCED"
 
 
+def build_daily_vp_context(candles_5m):
+    """
+    Construit le Volume Profile Daily :
+    - journée UTC actuelle (developing Daily VP)
+    - journée UTC précédente complète
+    - classification de migration : BULLISH / BEARISH / BALANCED
+
+    N'influence pas directement les signaux de trading.
+    """
+    if not candles_5m:
+        return None
+
+    # Regrouper les bougies 5m par journée UTC
+    days = {}
+
+    for candle in candles_5m:
+        ts = candle.get("timestamp", 0)
+        if not ts:
+            continue
+
+        day = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+        days.setdefault(day, []).append(candle)
+
+    if len(days) < 2:
+        return None
+
+    sorted_days = sorted(days.keys())
+
+    current_day = sorted_days[-1]
+    previous_day = sorted_days[-2]
+
+    current_candles = days[current_day]
+    previous_candles = days[previous_day]
+
+    # Éviter de calculer un profil sur trop peu de données
+    if len(current_candles) < 12 or len(previous_candles) < 12:
+        return None
+
+    def make_vp(candles):
+        highs = [c["high"] for c in candles]
+        lows = [c["low"] for c in candles]
+        closes = [c["close"] for c in candles]
+        volumes = [c["volume"] for c in candles]
+
+        return calc_volume_profile(
+            highs,
+            lows,
+            closes,
+            volumes,
+            len(candles),
+            VP_BINS,
+            VALUE_PCT
+        )
+
+    current_vp = make_vp(current_candles)
+    previous_vp = make_vp(previous_candles)
+
+    if current_vp is None or previous_vp is None:
+        return None
+
+    direction = classify_vp_direction(current_vp, previous_vp)
+
+    return {
+        "current": current_vp,
+        "previous": previous_vp,
+        "direction": direction,
+        "current_day": str(current_day),
+        "previous_day": str(previous_day),
+        "current_bars": len(current_candles),
+        "previous_bars": len(previous_candles),
+    }
+
+
+
 # ════════════════════════════════════════════════════════
 # RR DYNAMIQUE
 # ════════════════════════════════════════════════════════
