@@ -585,6 +585,95 @@ def build_multi_vp_context(candles_5m):
         "complete": available_count == 3,
     }
 
+def score_multi_vp_context(multi_vp):
+    """
+    Score directionnel autonome des 3 Volume Profiles.
+
+    Pondération :
+    - Daily VP  : jusqu'à +/-2.0, pondéré par maturité du jour
+    - Fixed 4H  : +/-2.0, direction basée sur 2 blocs terminés
+    - Session VP: jusqu'à +/-1.0, pondéré par maturité session
+
+    Score théorique final : -5.0 à +5.0
+
+    Cette fonction n'influence pas encore les signaux de trading.
+    """
+    if not multi_vp:
+        return None
+
+    daily_ctx = multi_vp.get("daily")
+    h4_ctx = multi_vp.get("h4")
+    session_ctx = multi_vp.get("session")
+
+    daily_score = 0.0
+    h4_score = 0.0
+    session_score = 0.0
+
+    daily_maturity = 0.0
+    session_maturity = 0.0
+
+    # ── Daily VP ───────────────────────────────────────────────
+    # 288 bougies de 5m = 24h
+    if daily_ctx:
+        daily_maturity = min(
+            daily_ctx.get("current_bars", 0) / 288.0,
+            1.0
+        )
+
+        daily_direction = daily_ctx.get("direction", "BALANCED")
+
+        if daily_direction == "BULLISH":
+            daily_score = 2.0 * daily_maturity
+        elif daily_direction == "BEARISH":
+            daily_score = -2.0 * daily_maturity
+
+    # ── Fixed 4H VP ────────────────────────────────────────────
+    # Direction basée sur 2 blocs 4H terminés : poids complet
+    if h4_ctx:
+        h4_direction = h4_ctx.get("direction", "BALANCED")
+
+        if h4_direction == "BULLISH":
+            h4_score = 2.0
+        elif h4_direction == "BEARISH":
+            h4_score = -2.0
+
+    # ── Session VP ─────────────────────────────────────────────
+    if session_ctx:
+        session_maturity = session_ctx.get("maturity", 0.0)
+        session_direction = session_ctx.get("direction", "BALANCED")
+
+        if session_direction == "BULLISH":
+            session_score = 1.0 * session_maturity
+        elif session_direction == "BEARISH":
+            session_score = -1.0 * session_maturity
+
+    total_score = daily_score + h4_score + session_score
+
+    # ── Classification globale ─────────────────────────────────
+    if total_score >= 3.0:
+        bias = "STRONG_BULLISH"
+    elif total_score >= 1.0:
+        bias = "BULLISH"
+    elif total_score <= -3.0:
+        bias = "STRONG_BEARISH"
+    elif total_score <= -1.0:
+        bias = "BEARISH"
+    else:
+        bias = "NEUTRAL"
+
+    return {
+        "score": round(total_score, 2),
+        "bias": bias,
+        "daily_score": round(daily_score, 2),
+        "h4_score": round(h4_score, 2),
+        "session_score": round(session_score, 2),
+        "daily_maturity": round(daily_maturity, 2),
+        "session_maturity": round(session_maturity, 2),
+        "complete": multi_vp.get("complete", False),
+        "available_count": multi_vp.get("available_count", 0),
+    }
+
+
 
 # ════════════════════════════════════════════════════════
 # RR DYNAMIQUE
