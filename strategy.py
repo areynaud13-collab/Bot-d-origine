@@ -419,6 +419,138 @@ def build_fixed_4h_vp_context(candles_5m):
     }
 
 
+def build_session_vp_context(candles_5m):
+    """
+    Construit le Volume Profile de session.
+
+    Sessions UTC :
+    - ASIA   : 00h00 -> 07h00
+    - LONDON : 07h00 -> 13h30
+    - NEW_YORK : 13h30 -> 00h00
+
+    Compare la session actuelle en développement
+    à la session précédente terminée.
+
+    N'influence pas encore directement les signaux.
+    """
+    if not candles_5m:
+        return None
+
+    sessions = {}
+
+    def get_session_info(dt):
+        total_min = dt.hour * 60 + dt.minute
+
+        if total_min >= 13 * 60 + 30:
+            session_name = "NEW_YORK"
+            start_hour = 13
+            start_minute = 30
+
+        elif total_min >= 7 * 60:
+            session_name = "LONDON"
+            start_hour = 7
+            start_minute = 0
+
+        else:
+            session_name = "ASIA"
+            start_hour = 0
+            start_minute = 0
+
+        session_start = dt.replace(
+            hour=start_hour,
+            minute=start_minute,
+            second=0,
+            microsecond=0
+        )
+
+        return session_start, session_name
+
+    # Regrouper les bougies 5m par session
+    for candle in candles_5m:
+        ts = candle.get("timestamp", 0)
+        if not ts:
+            continue
+
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        session_start, session_name = get_session_info(dt)
+
+        key = (session_start, session_name)
+        sessions.setdefault(key, []).append(candle)
+
+    if len(sessions) < 2:
+        return None
+
+    sorted_sessions = sorted(
+        sessions.keys(),
+        key=lambda x: x[0]
+    )
+
+    current_key = sorted_sessions[-1]
+    previous_key = sorted_sessions[-2]
+
+    current_candles = sessions[current_key]
+    previous_candles = sessions[previous_key]
+
+    def make_vp(candles):
+        if len(candles) < 6:
+            return None
+
+        highs = [c["high"] for c in candles]
+        lows = [c["low"] for c in candles]
+        closes = [c["close"] for c in candles]
+        volumes = [c["volume"] for c in candles]
+
+        return calc_volume_profile(
+            highs,
+            lows,
+            closes,
+            volumes,
+            len(candles),
+            VP_BINS,
+            VALUE_PCT
+        )
+
+    current_vp = make_vp(current_candles)
+    previous_vp = make_vp(previous_candles)
+
+    if previous_vp is None:
+        return None
+
+    direction = (
+        classify_vp_direction(current_vp, previous_vp)
+        if current_vp is not None
+        else "BALANCED"
+    )
+
+    current_name = current_key[1]
+
+    # Nombre théorique de bougies 5m par session
+    if current_name == "ASIA":
+        full_bars = 84       # 7h
+    elif current_name == "LONDON":
+        full_bars = 78       # 6h30
+    else:
+        full_bars = 126      # 10h30
+
+    maturity = min(
+        len(current_candles) / float(full_bars),
+        1.0
+    )
+
+    return {
+        "current": current_vp,
+        "previous": previous_vp,
+        "direction": direction,
+        "session": current_name,
+        "previous_session": previous_key[1],
+        "maturity": round(maturity, 2),
+        "current_start": current_key[0].isoformat(),
+        "previous_start": previous_key[0].isoformat(),
+        "current_bars": len(current_candles),
+        "previous_bars": len(previous_candles),
+    }
+
+
 # ════════════════════════════════════════════════════════
 # RR DYNAMIQUE
 # ════════════════════════════════════════════════════════
