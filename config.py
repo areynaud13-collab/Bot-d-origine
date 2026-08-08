@@ -28,7 +28,7 @@ INTERVAL_SIGNAL   = "5m"    # Signal décisionnel
 INTERVAL_CONFIRM  = "1m"    # Confirmation entrée
 INTERVAL_HTF_1H   = "1H"    # Structure + Sweep (MAJUSCULE Bitget)
 INTERVAL_HTF_4H   = "4H"    # Liquidité + OB + DXY (MAJUSCULE Bitget)
-CANDLES_5M        = 300     # ~25h historique 5m
+CANDLES_5M        = 650     # ~54h historique 5m _ source VP Daily actuel + précédent
 CANDLES_1M        = 10      # Confirmation micro
 CANDLES_1H        = 90      # Bitget limite 100 max (90+10=100)
 CANDLES_4H        = 100     # Liquidité 4h
