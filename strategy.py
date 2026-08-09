@@ -836,7 +836,7 @@ def build_sweep_map_1h(candles_1h):
         sweep_bear = highs[i] > key_high * (1 + tol) and closes[i] < key_high
         if sweep_bull or sweep_bear:
             ts = candles_1h[i].get("timestamp", i)
-            sweep_map[ts] = {"sweep_bull": sweep_bull, "sweep_bear": sweep_bear}
+        sweep_map[ts] = {"sweep_bull": sweep_bull, "sweep_bear": sweep_bear, "timestamp": ts}    
     return sweep_map
 
 
