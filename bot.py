@@ -617,8 +617,8 @@ def refresh_htf_maps(candles_4h, candles_1h, candles_dxy_4h):
     if candles_1h:
         ts_1h = candles_1h[-1].get("timestamp", 0)
         if ts_1h != state.last_1h_ts:
-            state.sweep_map  = build_sweep_map_1h(candles_1h)
-            state.struct_map = build_structure_1h(candles_1h)
+            state.sweep_map  = build_sweep_map_1h(candles_1h[:-1])
+            state.struct_map = build_structure_1h(candles_1h[:-1])
             state.last_1h_ts = ts_1h
             log.info(f"Cartes 1h recalculées | Sweep:{len(state.sweep_map)} Struct:{len(state.struct_map)}")
 
