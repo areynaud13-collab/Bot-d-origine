@@ -1088,8 +1088,10 @@ def calc_signal(candles_5m, candles_1m,
     # Sweep actif (expiry 4h)
     sweep_bull = False; sweep_bear = False
     if sweep_ctx and isinstance(sweep_ctx, dict):
-        sweep_bull = sweep_ctx.get("sweep_bull", False)
-        sweep_bear = sweep_ctx.get("sweep_bear", False)
+        sweep_ts = sweep_ctx.get("timestamp", 0)
+        if 0 <= ts_now - sweep_ts <= SWEEP_EXPIRY:
+            sweep_bull = sweep_ctx.get("sweep_bull", False)
+            sweep_bear = sweep_ctx.get("sweep_bear", False)
 
     struct = struct_ctx if isinstance(struct_ctx, str) else "NEUTRAL"
     dxy_struct = dxy_ctx if isinstance(dxy_ctx, str) else "NEUTRAL"
