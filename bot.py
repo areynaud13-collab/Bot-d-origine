@@ -606,8 +606,8 @@ def refresh_htf_maps(candles_4h, candles_1h, candles_dxy_4h):
     if candles_4h:
         ts_4h = candles_4h[-1].get("timestamp", 0)
         if ts_4h != state.last_4h_ts:
-            state.liq_map    = build_liquidity_map_4h(candles_4h)
-            state.ob_map     = build_order_blocks_4h(candles_4h)
+            state.liq_map    = build_liquidity_map_4h(candles_4h[:-1])
+            state.ob_map     = build_order_blocks_4h(candles_4h[:-1])
             if candles_dxy_4h and DXY_ENABLED:
                 state.dxy_map = build_dxy_structure_4h(candles_dxy_4h)
             state.last_4h_ts = ts_4h
