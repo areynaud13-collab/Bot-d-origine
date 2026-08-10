@@ -861,7 +861,7 @@ def build_structure_1h(candles_1h):
         if len(ph) >= 2 and len(pl) >= 2:
             if ph[-1] > ph[-2] and pl[-1] > pl[-2]: struct = "BULLISH"
             elif ph[-1] < ph[-2] and pl[-1] < pl[-2]: struct = "BEARISH"
-        ts = candles_1h[i].get("timestamp", i)
+        ts = candles_1h[i].get("timestamp", i) + 3600
         struct_map[ts] = struct
     return struct_map
 
