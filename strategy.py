@@ -768,7 +768,7 @@ def build_order_blocks_4h(candles_4h):
                 closes[j+1] < lows[j]):
                 if all(highs[k] <= highs[j] * 1.002 for k in range(j+1, i)):
                     ob_bear.append({"h": highs[j], "l": lows[j]})
-        ts = candles_4h[i].get("timestamp", i)
+        ts = candles_4h[i].get("timestamp", i) + 14400
         ob_map[ts] = {"ob_bull": ob_bull[-3:], "ob_bear": ob_bear[-3:]}
     return ob_map
 
