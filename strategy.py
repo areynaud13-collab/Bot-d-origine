@@ -1144,7 +1144,10 @@ def calc_signal(candles_5m, candles_1m,
             return None
         # Ajustement TP via liquidité 4h
         tp1_adj = adjust_tp_for_liquidity(side, price, tp1, at, liq_ctx)
-        tp2_adj = adjust_tp_for_liquidity(side, price, tp2, at, liq_ctx)
+        tp2_floor = round(tp1_adj + sl_dist * 0.4, 2) if side == "long" else round(tp1_adj - sl_dist * 0.4, 2)
+        tp2_target = max(tp2, tp2_floor) if side == "long" else min(tp2, tp2_floor)
+        tp2_liq = adjust_tp_for_liquidity(side, tp1_adj, tp2_target, at, liq_ctx)
+        tp2_adj = max(tp2_liq, tp2_floor) if side == "long" else min(tp2_liq, tp2_floor)
         # Vérif RR minimum après ajustement
         rr_adj = (tp1_adj-price)/sl_dist if side=="long" else (price-tp1_adj)/sl_dist
         if rr_adj < MIN_RR:
