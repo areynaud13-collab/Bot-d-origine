@@ -406,7 +406,7 @@ def open_position(signal, risk_pct):
     lot_total = int(min(contracts_risk, contracts_margin))
     lot_total -= lot_total % 3
     if lot_total < 3:
-    return
+        return
     lot_tp1 = lot_total * 2 // 3
     lot_tp2 = lot_total - lot_tp1
 
