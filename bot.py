@@ -374,10 +374,10 @@ def check_drawdown():
 # CALCUL P&L
 # ════════════════════════════════════════════════════════
 
-def _calc_pnl(side, entry, exit_p, lot):
-    """P&L en dollars sur une fermeture partielle ou totale."""
-    raw = (exit_p - entry) / entry if side == "long" else (entry - exit_p) / entry
-    return round(raw * (lot / 0.01) * 0.01 * entry * LEVERAGE, 2)
+def _calc_pnl(side, entry, exit_p, contracts):
+    """P&L Bitget en USDT selon le nombre de contrats."""
+    price_move = (exit_p - entry) if side == "long" else (entry - exit_p)
+    return round(price_move * contracts * state.contract_size, 2)
 
 
 # ════════════════════════════════════════════════════════
@@ -399,14 +399,16 @@ def open_position(signal, risk_pct):
     tp2    = signal["tp2"]
     sl_dist = abs(entry - sl)
 
-    # Sizing avec risque adapté au niveau DD
-    risk_usd  = CAPITAL * risk_pct
-    lot_total = calc_lot_size(risk_usd, sl_dist, entry)
-    lot_tp1   = round(lot_total * LOT_RATIO_TP1, 2)  # 2/3 → min 0.02
-    lot_tp2   = round(lot_total * LOT_RATIO_TP2, 2)  # 1/3 → min 0.01
-    # LOT_MIN = 0.03 garantit lot_tp1 ≥ 0.02 et lot_tp2 ≥ 0.01
-    if lot_tp1 < 0.01: lot_tp1 = 0.01
-    if lot_tp2 < 0.01: lot_tp2 = 0.01
+    # Sizing Bitget en contrats — risque + plafond de marge
+    risk_usd = CAPITAL * risk_pct
+    contracts_risk = risk_usd / (sl_dist * state.contract_size)
+    contracts_margin = (CAPITAL * MARGIN_CAP * LEVERAGE) / (entry * state.contract_size)
+    lot_total = int(min(contracts_risk, contracts_margin))
+    lot_total -= lot_total % 3
+    if lot_total < 3:
+    return
+    lot_tp1 = lot_total * 2 // 3
+    lot_tp2 = lot_total - lot_tp1
 
     state.trade_counter += 1
     trade_id = f"V4-{state.trade_counter:04d}"
