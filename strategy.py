@@ -731,7 +731,7 @@ def build_liquidity_map_4h(candles_4h):
                     lvl = round((wl[j]+wl[k])/2, 2)
                     if not any(abs(lvl-x)/lvl < tol for x in eq_l):
                         eq_l.append(lvl)
-        ts = candles_4h[i].get("timestamp", i)
+        ts = candles_4h[i].get("timestamp", i) + 14400
         liq_map[ts] = {"eq_highs": sorted(eq_h), "eq_lows": sorted(eq_l)}
     return liq_map
 
