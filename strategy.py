@@ -1133,7 +1133,7 @@ def calc_signal(candles_5m, candles_1m,
             elif dxy_struct == "BEARISH":  sc -= DXY_MALUS   # dollar faible = mauvais SHORT or
         return sc
 
-       def build_signal(side, setup, sl, tp1, tp2, score, tags):
+ def build_signal(side, setup, sl, tp1, tp2, score, tags):
         """Construit le dict signal avec sizing."""
         level_price = price
         if setup == "VAL->POC":
