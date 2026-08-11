@@ -32,7 +32,7 @@ from strategy import (
 import bitget as exchange
 import dashboard
 
-STATE_FILE = "bot_state.json"
+STATE_FILE = "/data/bot_state.json"
 
 
 # ── Logging ─────────────────────────────────────────────────────
