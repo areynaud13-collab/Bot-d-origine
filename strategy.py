@@ -1057,7 +1057,7 @@ def calc_signal(candles_5m, candles_1m,
 
     # ── ADX — score de base selon régime ─────────────────────────
     if ax < 25:   ms_base = 3.0   # Range
-    elif ax > 35: ms_base = 4.0   # Trend fort
+    elif ax > 35: ms_base = 3.5   # Trend fort
     else:         ms_base = 3.5   # Transition
 
     # ── Delta — signaux d'order flow ─────────────────────────────
