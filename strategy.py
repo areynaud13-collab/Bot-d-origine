@@ -1149,9 +1149,7 @@ def calc_signal(candles_5m, candles_1m,
         elif setup == "TF1-VWAP" and vw:
             level_price = vw["vwap"]
 
-        confirmed_1m, _ = confirm_entry_1m(candles_1m, side, level_price, at)
-        if not confirmed_1m:
-            return None
+        
 
         sl_dist = abs(price - sl)
         sl_dist = abs(price - sl)
