@@ -931,7 +931,7 @@ def confirm_entry_1m(candles_1m, side, level_price, atr):
     """
     if not candles_1m or len(candles_1m) < 2:
         return False, None
-    for c in reversed(candles_1m[-5:]):
+    for c in reversed(candles_1m[-6:-1]):
         o  = c.get("open",  c.get("o", 0))
         h  = c.get("high",  c.get("h", 0))
         l  = c.get("low",   c.get("l", 0))
