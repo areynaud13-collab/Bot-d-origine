@@ -1133,9 +1133,9 @@ def calc_signal(candles_5m, candles_1m,
             elif dxy_struct == "BEARISH":  sc -= DXY_MALUS   # dollar faible = mauvais SHORT or
         return sc
 
-    def build_signal(side, setup, sl, tp1, tp2, score, tags):
+       def build_signal(side, setup, sl, tp1, tp2, score, tags):
         """Construit le dict signal avec sizing."""
-                level_price = price
+        level_price = price
         if setup == "VAL->POC":
             level_price = val
         elif setup in ("POC->VAH", "POC->VAL", "TF2-POC"):
@@ -1152,6 +1152,8 @@ def calc_signal(candles_5m, candles_1m,
         confirmed_1m, _ = confirm_entry_1m(candles_1m, side, level_price, at)
         if not confirmed_1m:
             return None
+
+        sl_dist = abs(price - sl)
         sl_dist = abs(price - sl)
         if sl_dist < MIN_SL_DIST:
             return None
