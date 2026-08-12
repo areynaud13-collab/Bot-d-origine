@@ -18,6 +18,7 @@
 import time
 import json
 import logging
+import os
 import threading
 import requests as req
 from datetime import datetime, date, timezone
@@ -33,6 +34,8 @@ import bitget as exchange
 import dashboard
 
 STATE_FILE = "/data/bot_state.json"
+STATE_BACKUP_FILE = "/data/bot_state.backup.json"
+STATE_VERSION = 2
 
 
 # ── Logging ─────────────────────────────────────────────────────
@@ -156,6 +159,7 @@ class State:
             self.daily_wins   = 0
             self.daily_losses = 0
             self.start_date   = date.today()
+            save_state()
 
     @property
     def wr(self):
@@ -191,57 +195,211 @@ trades = []
 
 
 # ── Persistance état ────────────────────────────────────────────
+def _json_safe(value):
+    """Convertit récursivement les scalaires non natifs (ex. NumPy) en types JSON."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if hasattr(value, "item"):
+        return _json_safe(value.item())
+    raise TypeError(f"Type non sérialisable dans l'état: {type(value).__name__}")
+
+
+def _state_payload():
+    position = _json_safe(state.position) if state.position is not None else None
+    return {
+        "state_version":   STATE_VERSION,
+        "position":        position,
+        "last_price":      state.last_price,
+        "paper_balance":   state.paper_balance,
+        "paper_pnl":       state.paper_pnl,
+        "peak_capital":    state.peak_capital,
+        "dd_level":        state.dd_level,
+        "dd_pause_until":  state.dd_pause_until,
+        "consec_losses":   state.consec_losses,
+        "wins":            state.wins,
+        "losses":          state.losses,
+        "total_trades":    state.total_trades,
+        "trade_counter":   state.trade_counter,
+        "daily_pnl":       state.daily_pnl,
+        "daily_trades":    state.daily_trades,
+        "daily_wins":      state.daily_wins,
+        "daily_losses":    state.daily_losses,
+        "start_date":      state.start_date.isoformat(),
+        "last_sl_long":    state.last_sl_long,
+        "last_sl_short":   state.last_sl_short,
+    }
+
+
+def _fsync_directory(path):
+    directory = os.path.dirname(path) or "."
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_json(path, payload):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(_json_safe(payload), f, ensure_ascii=False, separators=(",", ":"))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+    _fsync_directory(path)
+
+
+def _validate_state_dict(d):
+    if not isinstance(d, dict):
+        raise ValueError("état racine non dictionnaire")
+
+    numeric_fields = (
+        "paper_balance", "paper_pnl", "peak_capital", "dd_pause_until",
+        "last_sl_long", "last_sl_short",
+    )
+    for key in numeric_fields:
+        if key in d and (isinstance(d[key], bool) or not isinstance(d[key], (int, float))):
+            raise ValueError(f"champ {key} invalide")
+
+    int_fields = (
+        "dd_level", "consec_losses", "wins", "losses", "total_trades",
+        "trade_counter", "daily_trades", "daily_wins", "daily_losses",
+    )
+    for key in int_fields:
+        if key in d and (isinstance(d[key], bool) or not isinstance(d[key], int) or d[key] < 0):
+            raise ValueError(f"champ {key} invalide")
+
+    if "paper_balance" in d and d["paper_balance"] <= 0:
+        raise ValueError("paper_balance invalide")
+    if "peak_capital" in d and d["peak_capital"] <= 0:
+        raise ValueError("peak_capital invalide")
+    if "dd_level" in d and not 0 <= d["dd_level"] <= 4:
+        raise ValueError("dd_level invalide")
+
+    if d.get("start_date") is not None:
+        date.fromisoformat(d["start_date"])
+
+    position = d.get("position")
+    if position is not None:
+        if not isinstance(position, dict):
+            raise ValueError("position invalide")
+        required = (
+            "trade_id", "side", "entry", "sl", "tp1", "tp2",
+            "lot_total", "lot_tp1", "lot_tp2", "tp1_hit",
+            "sl_lot2", "entry_time",
+        )
+        missing = [key for key in required if key not in position]
+        if missing:
+            raise ValueError(f"position incomplète: {','.join(missing)}")
+        if position["side"] not in ("long", "short"):
+            raise ValueError("side position invalide")
+        if not isinstance(position["trade_id"], str):
+            raise ValueError("trade_id invalide")
+        entry_time = datetime.fromisoformat(position["entry_time"])
+        if entry_time.tzinfo is None:
+            raise ValueError("entry_time sans timezone")
+        for key in ("entry", "sl", "tp1", "tp2", "sl_lot2"):
+            if isinstance(position[key], bool) or not isinstance(position[key], (int, float)):
+                raise ValueError(f"position {key} invalide")
+        for key in ("lot_total", "lot_tp1", "lot_tp2"):
+            if isinstance(position[key], bool) or not isinstance(position[key], int) or position[key] <= 0:
+                raise ValueError(f"position {key} invalide")
+        if not isinstance(position["tp1_hit"], bool):
+            raise ValueError("tp1_hit invalide")
+
+    return d
+
+
+def _read_valid_state(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return _validate_state_dict(json.load(f))
+
+
 def save_state():
     try:
-        with open(STATE_FILE, "w") as f:
-            json.dump({
-                "paper_balance":  state.paper_balance,
-                "paper_pnl":      state.paper_pnl,
-                "peak_capital":   state.peak_capital,
-                "dd_level":       state.dd_level,
-                "dd_pause_until": state.dd_pause_until,
-                "consec_losses":  state.consec_losses,
-                "wins":           state.wins,
-                "losses":         state.losses,
-                "total_trades":   state.total_trades,
-                "trade_counter":  state.trade_counter,
-                "daily_pnl":      state.daily_pnl,
-                "daily_trades":   state.daily_trades,
-                "last_sl_long":   state.last_sl_long,
-                "last_sl_short":  state.last_sl_short,
-                "last_4h_ts":     state.last_4h_ts,
-                "last_1h_ts":     state.last_1h_ts,
-            }, f)
+        payload = _json_safe(_state_payload())
+        _validate_state_dict(payload)
+        _atomic_write_json(STATE_FILE, payload)
+        _atomic_write_json(STATE_BACKUP_FILE, payload)
+        return True
     except Exception as e:
-        log.warning(f"save_state: {e}")
+        log.error(f"save_state: {e}", exc_info=True)
+        return False
+
+
+def _apply_state(d):
+    state.paper_balance  = d.get("paper_balance",  float(CAPITAL))
+    state.paper_pnl      = d.get("paper_pnl",      0.0)
+    state.peak_capital   = d.get("peak_capital",   float(CAPITAL))
+    state.dd_level       = d.get("dd_level",       0)
+    state.dd_pause_until = d.get("dd_pause_until", 0)
+    state.consec_losses  = d.get("consec_losses",  0)
+    state.wins           = d.get("wins",           0)
+    state.losses         = d.get("losses",         0)
+    state.total_trades   = d.get("total_trades",   0)
+    state.trade_counter  = d.get("trade_counter",  0)
+    state.daily_pnl      = d.get("daily_pnl",      0.0)
+    state.daily_trades   = d.get("daily_trades",   0)
+    state.daily_wins     = d.get("daily_wins",     0)
+    state.daily_losses   = d.get("daily_losses",   0)
+    state.last_sl_long   = d.get("last_sl_long",   0.0)
+    state.last_sl_short  = d.get("last_sl_short",  0.0)
+    state.last_price     = d.get("last_price",      0.0)
+    state.start_date     = date.fromisoformat(d["start_date"]) if d.get("start_date") else date.today()
+
+    position = d.get("position")
+    if position is not None:
+        position = dict(position)
+        position["entry_time"] = datetime.fromisoformat(position["entry_time"])
+    state.position = position
+
+    # Les cartes MTF ne sont pas persistées : forcer leur recalcul au premier cycle.
+    state.liq_map = {}
+    state.ob_map = {}
+    state.sweep_map = {}
+    state.struct_map = {}
+    state.dxy_map = {}
+    state.last_4h_ts = 0
+    state.last_1h_ts = 0
 
 
 def load_state():
-    try:
-        with open(STATE_FILE) as f:
-            d = json.load(f)
-        state.paper_balance  = d.get("paper_balance",  float(CAPITAL))
-        state.paper_pnl      = d.get("paper_pnl",      0.0)
-        state.peak_capital   = d.get("peak_capital",   float(CAPITAL))
-        state.dd_level       = d.get("dd_level",       0)
-        state.dd_pause_until = d.get("dd_pause_until", 0)
-        state.consec_losses  = d.get("consec_losses",  0)
-        state.wins           = d.get("wins",           0)
-        state.losses         = d.get("losses",         0)
-        state.total_trades   = d.get("total_trades",   0)
-        state.trade_counter  = d.get("trade_counter",  0)
-        state.daily_pnl      = d.get("daily_pnl",      0.0)
-        state.daily_trades   = d.get("daily_trades",   0)
-        state.last_sl_long   = d.get("last_sl_long",   0.0)
-        state.last_sl_short  = d.get("last_sl_short",  0.0)
-        state.last_4h_ts     = d.get("last_4h_ts",     0)
-        state.last_1h_ts     = d.get("last_1h_ts",     0)
-        log.info(f"État chargé | Capital: ${state.paper_balance:.2f} | "
-                 f"Trades: {state.total_trades} | WR: {state.wr:.0f}%")
-    except FileNotFoundError:
-        log.info("Nouvel état initialisé")
-    except Exception as e:
-        log.warning(f"load_state: {e}")
+    errors = []
+    for path, label in ((STATE_FILE, "principal"), (STATE_BACKUP_FILE, "backup")):
+        try:
+            d = _read_valid_state(path)
+            _apply_state(d)
+            if label == "backup":
+                log.warning("État principal indisponible/invalide — backup restauré")
+                save_state()
+            elif d.get("state_version") != STATE_VERSION or not os.path.exists(STATE_BACKUP_FILE):
+                log.info("Migration/initialisation du schéma de persistance")
+                save_state()
+            log.info(
+                f"État chargé ({label}) | Capital: ${state.paper_balance:.2f} | "
+                f"Trades: {state.total_trades} | WR: {state.wr:.0f}% | "
+                f"Position: {state.position['trade_id'] if state.position else 'FLAT'}"
+            )
+            return True
+        except FileNotFoundError:
+            errors.append(f"{label}: absent")
+        except Exception as e:
+            errors.append(f"{label}: {e}")
+
+    log.critical("Aucun état persistant valide — " + " | ".join(errors))
+    return False
 
 
 # ════════════════════════════════════════════════════════
@@ -268,6 +426,7 @@ def close_weekend():
     state.paper_pnl    += pnl
     state.daily_pnl    += pnl
     state.position      = None
+    save_state()
     tg(f"⏰ <b>Weekend Close</b>\n"
        f"${pos['entry']:.2f}→${current_price:.2f} | {pnl:+.2f}$\n"
        f"Capital: ${state.paper_balance:.2f}")
@@ -318,6 +477,7 @@ def check_drawdown():
             log.error(f"🛑 DD STOP TOTAL {dd*100:.1f}% — Bot arrêté")
             tg(f"🛑 <b>DD STOP TOTAL {dd*100:.1f}%</b>\n"
                f"Capital: ${cap:.2f} | Reprise manuelle requise")
+            save_state()
         return False
 
     # Pause active
@@ -332,6 +492,7 @@ def check_drawdown():
         log.info(f"Pause DD terminée — reprise (DD: {dd*100:.1f}%)")
         tg(f"🟡 <b>Pause DD terminée</b> | DD: {dd*100:.1f}% | Capital: ${cap:.2f}")
         state.dd_pause_until = 0
+        save_state()
 
     # ── Mise à jour niveau DD selon seuils validés ───────────────
     old_level = state.dd_level
@@ -359,12 +520,14 @@ def check_drawdown():
         state.consec_losses  = 0
         log.warning(f"Série {DD_CONSEC_L2}+ pertes — pause {DD_PAUSE_CONSEC2//60}min")
         tg(f"⚠️ <b>Série {DD_CONSEC_L2} pertes</b> | Pause {DD_PAUSE_CONSEC2//60}min")
+        save_state()
         return False
 
     elif state.consec_losses >= DD_CONSEC_L1:
         state.dd_pause_until = time.time() + DD_PAUSE_CONSEC1
         state.consec_losses  = 0
         log.warning(f"Série {DD_CONSEC_L1} pertes — pause {DD_PAUSE_CONSEC1//60}min")
+        save_state()
         return False
 
     return True
@@ -446,6 +609,7 @@ def open_position(signal, risk_pct):
         "capital_at_entry": state.paper_balance,
     }
     state.position = pos
+    save_state()
 
     rr_cible = round(abs(tp1 - entry) / sl_dist, 2) if sl_dist > 0 else 0
     log.info(
@@ -507,6 +671,7 @@ def check_exits(current_price, last_1m_candle):
             if side == "long":  state.last_sl_long  = time.time()
             else:               state.last_sl_short = time.time()
             state.position = None
+            save_state()
             acct_pct = pnl / CAPITAL * 100
             log.info(f"❌ SL [{pos['setup']}] ${ep:.2f}→${exit_p:.2f} | "
                      f"{pnl:+.2f}$ ({acct_pct:+.1f}%) | Capital:${state.paper_balance:.2f} | "
@@ -530,6 +695,7 @@ def check_exits(current_price, last_1m_candle):
             # SL du lot restant remonté au TP1 (breakeven garanti)
             pos["tp1_hit"] = True
             pos["sl_lot2"] = pos["tp1"]
+            save_state()
             log.info(f"🟡 TP1 [{pos['setup']}] ${pos['tp1']:.2f} | "
                      f"Lot1 {pos['lot_tp1']} fermé → +{pnl_lot1:.2f}$ | "
                      f"SL Lot2 → ${pos['tp1']:.2f} (breakeven) | "
@@ -559,6 +725,7 @@ def check_exits(current_price, last_1m_candle):
             state.total_trades  += 1
             state.daily_trades  += 1
             state.position       = None
+            save_state()
             log.info(f"✅ TP1+BE [{pos['setup']}] | Lot2 BE ${exit_p:.2f} | "
                      f"{pnl_lot2:+.2f}$ | Capital:${state.paper_balance:.2f}")
             tg(f"✅ <b>TP1+BE — {pos['setup']}</b>\n"
@@ -581,6 +748,7 @@ def check_exits(current_price, last_1m_candle):
             state.total_trades  += 1
             state.daily_trades  += 1
             state.position       = None
+            save_state()
             acct_pct = pnl_lot2 / CAPITAL * 100
             log.info(f"🎯 TP2 [{pos['setup']}] ${pos['tp2']:.2f} | "
                      f"+{pnl_lot2:.2f}$ ({acct_pct:+.1f}%) | "
@@ -632,14 +800,17 @@ def refresh_htf_maps(candles_4h, candles_1h, candles_dxy_4h):
 def main():
     log.info("=" * 65)
     log.info("  VP+VWAP+DELTA+MTF SCALPER V4 [BITGET] — Sans EMA · DXY 4h")
-    log.info(f"  {SYMBOL} · Capital: ${CAPITAL} · Levier: {LEVERAGE}x")
+    log.info(f"  {SYMBOL} · Capital config: ${CAPITAL} · Levier: {LEVERAGE}x")
     log.info(f"  MTF: 4h(Liq+OB+DXY) / 1h(Struct+Sweep) / 5m(Signal) / 1m(Confirm)")
     log.info(f"  1 position · Fermeture partielle TP1(2/3)+TP2(1/3)")
     log.info(f"  DD 4 niveaux (20% max) · Lot max:{LOT_MAX} · Marge max:{MARGIN_CAP*100:.0f}%")
     log.info(f"  Mode: {'📄 PAPER' if PAPER_MODE else '💰 LIVE FUTURES'}")
     log.info("=" * 65)
 
-    load_state()
+    if not load_state():
+        log.critical("Démarrage trading refusé : état persistant non restaurable")
+        tg("🛑 <b>PERSISTANCE</b> — état principal et backup invalides/absents. Trading non démarré.")
+        return
 
     try:
         info = exchange.get_contract_info(SYMBOL)
@@ -647,7 +818,7 @@ def main():
         log.info(f"1 contrat = {state.contract_size} oz XAU")
         tg(
             f"🤖 <b>VP+VWAP+Delta+MTF Scalper V4</b>\n"
-            f"{SYMBOL} · {LEVERAGE}x · Capital: ${CAPITAL}\n"
+            f"{SYMBOL} · {LEVERAGE}x · Capital état: ${state.paper_balance:.2f}\n"
             f"MTF 4h/1h/5m/1m · Sans EMA · DXY: {'✅' if DXY_ENABLED else '⏸️'}\n"
             f"DD max 20% · Lot max {LOT_MAX} · Marge {MARGIN_CAP*100:.0f}%\n"
             f"{'📄 PAPER MODE' if PAPER_MODE else '💰 LIVE'}"
