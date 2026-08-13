@@ -38,6 +38,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 SHADOW_VERSION = "13A.1"
+KPI_VERSION = "13A-KPI.1"
 DEFAULT_TTLS: Tuple[int, ...] = (2, 3, 5)
 ONE_MINUTE_SECONDS = 60
 
@@ -160,7 +161,27 @@ class EntryShadowLab:
         self._lock = threading.RLock()
         self._pending: Dict[str, PendingSetup] = {}
         self._seen_setup_ids: set[str] = set()
+
+        # KPI 13A : journal et état STRICTEMENT séparés du journal shadow historique.
+        # Aucun write/truncate n'est effectué sur entry_shadow_13A.jsonl par cette couche.
+        self.kpi_jsonl_path = os.getenv(
+            "SHADOW_13A_KPI_LOG_PATH",
+            os.path.join(default_dir, "entry_shadow_13A_kpi.jsonl"),
+        )
+        self.kpi_state_path = os.getenv(
+            "SHADOW_13A_KPI_STATE_PATH",
+            os.path.join(default_dir, "entry_shadow_kpi_state_13A.json"),
+        )
+        self._kpi: Dict[str, int] = self._empty_kpi_counters()
+        self._kpi_pending_meta: Dict[str, Dict[str, Any]] = {}
+        self._blocked_outcomes: Dict[str, Dict[str, Any]] = {}
+
         self._load_state_best_effort()
+        self._load_kpi_state_best_effort()
+        self.log.info(
+            "SHADOW KPI | actif NON BLOQUANT | journal séparé=%s",
+            self.kpi_jsonl_path,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -176,6 +197,9 @@ class EntryShadowLab:
         bid: Optional[Any] = None,
         ask: Optional[Any] = None,
         live_price: Optional[Any] = None,
+        blocked_by_open_position: Optional[bool] = None,
+        open_position_side: Optional[Any] = None,
+        open_position_trade_id: Optional[Any] = None,
     ) -> Optional[str]:
         """
         Enregistre un setup 5m comme PENDING sans aucune action de trading.
@@ -276,10 +300,23 @@ class EntryShadowLab:
                         dropped,
                         extra={"reason": "max_pending"},
                     )
+                    self._kpi_drop_pending_best_effort(dropped.setup_id, reason="max_pending")
 
                 self._pending[setup_id] = pending
                 self._seen_setup_ids.add(setup_id)
                 self._persist_state_best_effort()
+
+            effective_blocked = (
+                bool(signal.get("shadow_position_open", False))
+                if blocked_by_open_position is None
+                else bool(blocked_by_open_position)
+            )
+            self._kpi_register_setup_best_effort(
+                pending,
+                blocked_by_open_position=effective_blocked,
+                open_position_side=open_position_side,
+                open_position_trade_id=open_position_trade_id,
+            )
 
             self._write_event_best_effort("PENDING", pending)
             self.log.info(
@@ -323,6 +360,11 @@ class EntryShadowLab:
 
             finalised: List[Dict[str, Any]] = []
 
+            # Évalue uniquement les outcomes de triggers déjà créés sur une bougie
+            # antérieure. La bougie qui déclenche l'entrée shadow n'est jamais
+            # réutilisée pour prétendre qu'un TP/SL a été touché après l'entrée.
+            self._update_blocked_outcomes_best_effort(parsed)
+
             with self._lock:
                 for setup_id in list(self._pending.keys()):
                     p = self._pending.get(setup_id)
@@ -353,6 +395,7 @@ class EntryShadowLab:
                     # le setup expire AVANT toute recherche de trigger.
                     if p.bars_seen > self.max_ttl:
                         result = self._finalise_expired(p, parsed)
+                        self._kpi_on_expire_best_effort(p)
                         finalised.append(result)
                         del self._pending[setup_id]
                         continue
@@ -380,12 +423,14 @@ class EntryShadowLab:
                             live_price=live_f,
                             metrics=metrics,
                         )
+                        self._kpi_on_trigger_best_effort(p, result)
                         finalised.append(result)
                         del self._pending[setup_id]
                         continue
 
                     if p.bars_seen >= self.max_ttl:
                         result = self._finalise_expired(p, parsed)
+                        self._kpi_on_expire_best_effort(p)
                         finalised.append(result)
                         del self._pending[setup_id]
 
@@ -405,6 +450,14 @@ class EntryShadowLab:
                 "pending_count": len(self._pending),
                 "pending": [_json_safe(asdict(p)) for p in self._pending.values()],
             }
+
+    def kpi_snapshot(self) -> Dict[str, Any]:
+        """Retourne les KPI d'opportunités bloquées sans effet sur le trading."""
+        with self._lock:
+            out = dict(self._kpi)
+            out["blocked_outcomes_open"] = len(self._blocked_outcomes)
+            out["kpi_version"] = KPI_VERSION
+            return out
 
     # ------------------------------------------------------------------
     # Trigger et métriques
@@ -630,6 +683,373 @@ class EntryShadowLab:
             self.max_ttl,
         )
         return result
+
+    # ------------------------------------------------------------------
+    # KPI opportunités bloquées — journal séparé, NON BLOQUANT
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _empty_kpi_counters() -> Dict[str, int]:
+        return {
+            "total_setups": 0,
+            "setups_when_flat": 0,
+            "setups_blocked_by_open_position": 0,
+            "blocked_long": 0,
+            "blocked_short": 0,
+            "blocked_same_direction": 0,
+            "blocked_opposite_direction": 0,
+            "blocked_triggered": 0,
+            "blocked_expired": 0,
+            "blocked_would_have_won": 0,
+            "blocked_would_have_lost": 0,
+        }
+
+    @staticmethod
+    def _normalise_side(value: Any) -> Optional[str]:
+        side = str(value or "").lower().strip()
+        return side if side in {"long", "short"} else None
+
+    def _kpi_register_setup_best_effort(
+        self,
+        p: PendingSetup,
+        *,
+        blocked_by_open_position: bool,
+        open_position_side: Optional[Any],
+        open_position_trade_id: Optional[Any],
+    ) -> None:
+        try:
+            open_side = self._normalise_side(open_position_side)
+            blocked = bool(blocked_by_open_position)
+            relation = "NOT BLOCKED"
+            if blocked:
+                if open_side == p.side:
+                    relation = "BLOCKED SAME SIDE"
+                elif open_side in {"long", "short"}:
+                    relation = "BLOCKED OPPOSITE SIDE"
+                else:
+                    relation = "BLOCKED UNKNOWN SIDE"
+
+            blocked_pair = (
+                f"{open_side.upper()} OPEN + NEW {p.side.upper()}"
+                if blocked and open_side in {"long", "short"}
+                else None
+            )
+            meta = {
+                "setup_id": p.setup_id,
+                "side": p.side,
+                "setup": p.setup,
+                "blocked_by_open_position": blocked,
+                "blocked_relation": relation,
+                "blocked_pair": blocked_pair,
+                "open_position_side": open_side,
+                "open_position_trade_id": (
+                    str(open_position_trade_id)
+                    if open_position_trade_id not in (None, "")
+                    else None
+                ),
+                "validated_at": p.validated_at,
+            }
+
+            with self._lock:
+                self._kpi["total_setups"] += 1
+                if not blocked:
+                    self._kpi["setups_when_flat"] += 1
+                else:
+                    self._kpi["setups_blocked_by_open_position"] += 1
+                    self._kpi[f"blocked_{p.side}"] += 1
+                    if relation == "BLOCKED SAME SIDE":
+                        self._kpi["blocked_same_direction"] += 1
+                    elif relation == "BLOCKED OPPOSITE SIDE":
+                        self._kpi["blocked_opposite_direction"] += 1
+
+                self._kpi_pending_meta[p.setup_id] = meta
+                self._append_kpi_jsonl_best_effort({
+                    "event": "KPI_SETUP",
+                    **meta,
+                    "counters": dict(self._kpi),
+                })
+                self._persist_kpi_state_best_effort()
+        except Exception as exc:
+            self.log.warning("SHADOW KPI register ignoré: %s", exc, exc_info=True)
+
+    def _kpi_drop_pending_best_effort(self, setup_id: str, *, reason: str) -> None:
+        try:
+            with self._lock:
+                meta = self._kpi_pending_meta.pop(setup_id, None)
+                if meta:
+                    self._append_kpi_jsonl_best_effort({
+                        "event": "KPI_DROPPED_PENDING",
+                        **meta,
+                        "reason": reason,
+                        "counters": dict(self._kpi),
+                    })
+                    self._persist_kpi_state_best_effort()
+        except Exception as exc:
+            self.log.warning("SHADOW KPI drop ignoré: %s", exc, exc_info=True)
+
+    def _kpi_on_expire_best_effort(self, p: PendingSetup) -> None:
+        try:
+            with self._lock:
+                meta = self._kpi_pending_meta.pop(p.setup_id, None)
+                if not meta:
+                    return
+                if meta.get("blocked_by_open_position"):
+                    self._kpi["blocked_expired"] += 1
+                self._append_kpi_jsonl_best_effort({
+                    "event": "KPI_EXPIRE",
+                    **meta,
+                    "counters": dict(self._kpi),
+                })
+                self._persist_kpi_state_best_effort()
+        except Exception as exc:
+            self.log.warning("SHADOW KPI expire ignoré: %s", exc, exc_info=True)
+
+    def _kpi_on_trigger_best_effort(
+        self,
+        p: PendingSetup,
+        result: Mapping[str, Any],
+    ) -> None:
+        try:
+            with self._lock:
+                meta = self._kpi_pending_meta.pop(p.setup_id, None)
+                if not meta:
+                    return
+
+                blocked = bool(meta.get("blocked_by_open_position"))
+                if blocked:
+                    self._kpi["blocked_triggered"] += 1
+
+                self._append_kpi_jsonl_best_effort({
+                    "event": "KPI_TRIGGER",
+                    **meta,
+                    "trigger_bar": result.get("trigger_bar"),
+                    "trigger_candle_ts": result.get("trigger_candle_ts"),
+                    "shadow_entry": result.get("shadow_entry"),
+                    "execution_source": result.get("execution_source"),
+                    "counters": dict(self._kpi),
+                })
+
+                # Win/loss : uniquement pour un setup bloqué ayant déclenché.
+                # Le suivi commence sur la 1m SUIVANTE : aucun look-ahead sur la
+                # bougie de trigger n'est autorisé.
+                if blocked:
+                    shadow_entry = _finite_float(result.get("shadow_entry"))
+                    sl = _finite_float(p.sl)
+                    tp1 = _finite_float(p.tp1)
+                    trigger_ts = _timestamp_seconds(result.get("trigger_candle_ts"))
+
+                    valid_targets = False
+                    if None not in (shadow_entry, sl, tp1) and trigger_ts > 0:
+                        if p.side == "long":
+                            valid_targets = bool(sl < shadow_entry < tp1)
+                        else:
+                            valid_targets = bool(tp1 < shadow_entry < sl)
+
+                    if valid_targets:
+                        self._blocked_outcomes[p.setup_id] = {
+                            **meta,
+                            "shadow_entry": shadow_entry,
+                            "sl": sl,
+                            "tp1": tp1,
+                            "trigger_candle_ts": trigger_ts,
+                            "last_candle_ts": trigger_ts,
+                        }
+                    else:
+                        self._append_kpi_jsonl_best_effort({
+                            "event": "KPI_OUTCOME_UNTRACKABLE",
+                            **meta,
+                            "shadow_entry": shadow_entry,
+                            "sl": sl,
+                            "tp1": tp1,
+                            "reason": "missing_or_invalid_targets",
+                            "counters": dict(self._kpi),
+                        })
+
+                self._persist_kpi_state_best_effort()
+        except Exception as exc:
+            self.log.warning("SHADOW KPI trigger ignoré: %s", exc, exc_info=True)
+
+    def _update_blocked_outcomes_best_effort(self, candle: Mapping[str, Any]) -> None:
+        try:
+            candle_ts = _timestamp_seconds(candle.get("timestamp"))
+            high = _finite_float(candle.get("high"))
+            low = _finite_float(candle.get("low"))
+            if candle_ts <= 0 or high is None or low is None:
+                return
+
+            with self._lock:
+                changed = False
+                for setup_id in list(self._blocked_outcomes.keys()):
+                    tracker = self._blocked_outcomes.get(setup_id)
+                    if not tracker:
+                        continue
+
+                    last_ts = _timestamp_seconds(tracker.get("last_candle_ts"))
+                    if candle_ts <= last_ts:
+                        continue
+
+                    # Une bougie manquante détruit l'ordre temporel TP/SL : le cas
+                    # est classé inconnu plutôt que transformé artificiellement en win/loss.
+                    if last_ts > 0 and candle_ts > last_ts + ONE_MINUTE_SECONDS:
+                        self._append_kpi_jsonl_best_effort({
+                            "event": "KPI_OUTCOME_GAP",
+                            **tracker,
+                            "gap_from_ts": last_ts,
+                            "gap_to_ts": candle_ts,
+                            "reason": "missing_1m_candle_sequence",
+                            "counters": dict(self._kpi),
+                        })
+                        del self._blocked_outcomes[setup_id]
+                        changed = True
+                        continue
+
+                    side = tracker.get("side")
+                    sl = _finite_float(tracker.get("sl"))
+                    tp1 = _finite_float(tracker.get("tp1"))
+                    if side not in {"long", "short"} or sl is None or tp1 is None:
+                        del self._blocked_outcomes[setup_id]
+                        changed = True
+                        continue
+
+                    if side == "long":
+                        hit_win = high >= tp1
+                        hit_loss = low <= sl
+                    else:
+                        hit_win = low <= tp1
+                        hit_loss = high >= sl
+
+                    tracker["last_candle_ts"] = candle_ts
+
+                    # Si TP1 et SL sont tous deux contenus dans la même 1m, l'ordre
+                    # intrabar est indéterminable : on refuse de compter win ou loss.
+                    if hit_win and hit_loss:
+                        self._append_kpi_jsonl_best_effort({
+                            "event": "KPI_OUTCOME_AMBIGUOUS",
+                            **tracker,
+                            "outcome_candle_ts": candle_ts,
+                            "candle_high": high,
+                            "candle_low": low,
+                            "reason": "tp1_and_sl_same_1m",
+                            "counters": dict(self._kpi),
+                        })
+                        del self._blocked_outcomes[setup_id]
+                        changed = True
+                        continue
+
+                    if hit_win:
+                        self._kpi["blocked_would_have_won"] += 1
+                        self._append_kpi_jsonl_best_effort({
+                            "event": "KPI_WOULD_HAVE_WON",
+                            **tracker,
+                            "outcome_candle_ts": candle_ts,
+                            "candle_high": high,
+                            "candle_low": low,
+                            "counters": dict(self._kpi),
+                        })
+                        del self._blocked_outcomes[setup_id]
+                        changed = True
+                        continue
+
+                    if hit_loss:
+                        self._kpi["blocked_would_have_lost"] += 1
+                        self._append_kpi_jsonl_best_effort({
+                            "event": "KPI_WOULD_HAVE_LOST",
+                            **tracker,
+                            "outcome_candle_ts": candle_ts,
+                            "candle_high": high,
+                            "candle_low": low,
+                            "counters": dict(self._kpi),
+                        })
+                        del self._blocked_outcomes[setup_id]
+                        changed = True
+                        continue
+
+                    changed = True
+
+                if changed:
+                    self._persist_kpi_state_best_effort()
+        except Exception as exc:
+            self.log.warning("SHADOW KPI outcome ignoré: %s", exc, exc_info=True)
+
+    def _append_kpi_jsonl_best_effort(self, payload: Mapping[str, Any]) -> None:
+        try:
+            directory = os.path.dirname(self.kpi_jsonl_path) or "."
+            os.makedirs(directory, exist_ok=True)
+            row = {
+                "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+                "kpi_version": KPI_VERSION,
+                **_json_safe(dict(payload)),
+            }
+            with open(self.kpi_jsonl_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+                fh.write("\n")
+                fh.flush()
+        except Exception as exc:
+            self.log.warning("SHADOW KPI écriture JSONL impossible: %s", exc)
+
+    def _persist_kpi_state_best_effort(self) -> None:
+        try:
+            directory = os.path.dirname(self.kpi_state_path) or "."
+            os.makedirs(directory, exist_ok=True)
+            payload = {
+                "kpi_version": KPI_VERSION,
+                "counters": dict(self._kpi),
+                "pending_meta": _json_safe(self._kpi_pending_meta),
+                "blocked_outcomes": _json_safe(self._blocked_outcomes),
+            }
+            tmp = self.kpi_state_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.kpi_state_path)
+        except Exception as exc:
+            self.log.warning("SHADOW KPI persistance impossible: %s", exc)
+
+    def _load_kpi_state_best_effort(self) -> None:
+        try:
+            if not os.path.exists(self.kpi_state_path):
+                return
+            with open(self.kpi_state_path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            if payload.get("kpi_version") != KPI_VERSION:
+                return
+
+            counters = self._empty_kpi_counters()
+            saved = payload.get("counters", {})
+            for key in counters:
+                try:
+                    counters[key] = max(0, int(saved.get(key, 0)))
+                except (TypeError, ValueError):
+                    counters[key] = 0
+
+            pending_meta = payload.get("pending_meta", {})
+            blocked_outcomes = payload.get("blocked_outcomes", {})
+            if not isinstance(pending_meta, dict):
+                pending_meta = {}
+            if not isinstance(blocked_outcomes, dict):
+                blocked_outcomes = {}
+
+            self._kpi = counters
+            self._kpi_pending_meta = {
+                str(k): dict(v)
+                for k, v in pending_meta.items()
+                if isinstance(v, dict)
+            }
+            self._blocked_outcomes = {
+                str(k): dict(v)
+                for k, v in blocked_outcomes.items()
+                if isinstance(v, dict)
+            }
+
+            self.log.info(
+                "SHADOW KPI | restauré | total=%s blocked=%s outcomes_open=%s",
+                self._kpi["total_setups"],
+                self._kpi["setups_blocked_by_open_position"],
+                len(self._blocked_outcomes),
+            )
+        except Exception as exc:
+            self.log.warning("SHADOW KPI état ignoré: %s", exc, exc_info=True)
 
     # ------------------------------------------------------------------
     # Persistance shadow — best effort uniquement
