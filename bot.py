@@ -1393,6 +1393,17 @@ def _shadow_register_closed_5m(
                 bid=bid,
                 ask=ask,
                 live_price=live_price,
+                blocked_by_open_position=state.position is not None,
+                open_position_side=(
+                    state.position.get("side")
+                    if isinstance(state.position, dict)
+                    else None
+                ),
+                open_position_trade_id=(
+                    state.position.get("trade_id")
+                    if isinstance(state.position, dict)
+                    else None
+                ),
             )
 
     except Exception as exc:
