@@ -11,6 +11,24 @@ API_KEY    = os.environ.get("API_KEY",    "")
 API_SECRET = os.environ.get("API_SECRET", "")
 PASSPHRASE = os.environ.get("PASSPHRASE", "")
 
+# ── WebSocket Bitget public ──────────────────────────────────────
+WS_ENABLED                 = os.environ.get("WS_ENABLED", "true").lower() == "true"
+WS_PUBLIC_URL              = os.environ.get("WS_PUBLIC_URL", "wss://ws.bitget.com/v2/ws/public")
+WS_INST_TYPE               = "USDT-FUTURES"
+WS_HEARTBEAT_SECONDS       = 30.0
+WS_RECONNECT_MIN_SECONDS   = 1.0
+WS_RECONNECT_MAX_SECONDS   = 30.0
+WS_READY_TIMEOUT_SECONDS   = 15.0
+WS_CONSUMER_SLEEP_SECONDS   = 0.20
+WS_MAX_DATA_AGE_SECONDS     = 10.0
+WS_RECOVERY_MAX_1M_CANDLES = 100  # couverture recovery ~100 minutes max via REST 1m
+
+# ── Validation live au premier cutover Railway ───────────────────
+WS_STARTUP_VALIDATION = os.environ.get("WS_STARTUP_VALIDATION", "true").lower() == "true"
+WS_STARTUP_VALIDATION_ID = "12D_WS_V3_20260813"
+WS_STARTUP_VALIDATION_TIMEOUT_SECONDS = 360.0
+WS_STARTUP_RECONNECT_TIMEOUT_SECONDS = 60.0
+
 # ── Telegram ─────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
