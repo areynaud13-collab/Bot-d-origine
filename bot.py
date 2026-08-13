@@ -19,6 +19,7 @@ import time
 import json
 import logging
 import os
+import shutil
 import threading
 import requests as req
 from datetime import datetime, date, timezone
@@ -32,10 +33,14 @@ from strategy import (
 )
 import bitget as exchange
 import dashboard
+from bitget_ws import BitgetPublicWS
 
 STATE_FILE = "/data/bot_state.json"
 STATE_BACKUP_FILE = "/data/bot_state.backup.json"
-STATE_VERSION = 2
+STATE_VERSION = 3
+PRE_WS_CUTOVER_STATE_FILE = "/data/bot_state.pre_ws12d.json"
+PRE_WS_CUTOVER_BACKUP_FILE = "/data/bot_state.backup.pre_ws12d.json"
+WS_STARTUP_VALIDATION_MARKER_FILE = f"/data/ws_startup_validation_{WS_STARTUP_VALIDATION_ID}.json"
 
 
 # ── Logging ─────────────────────────────────────────────────────
@@ -150,6 +155,10 @@ class State:
         self.dxy_map         = {}
         self.last_4h_ts      = 0
         self.last_1h_ts      = 0
+        # Curseur temporel persistant du dernier événement marché effectivement traité.
+        self.last_processed_market_ts_ms = 0
+        # Version réellement chargée depuis disque (non persistée séparément).
+        self.loaded_state_version = STATE_VERSION
 
     def reset_daily(self):
         if date.today() != self.start_date:
@@ -194,6 +203,416 @@ state  = State()
 trades = []
 
 
+# ════════════════════════════════════════════════════════
+# WEBSOCKET CUTOVER — bootstrap / resynchronisation 1m+5m
+# ════════════════════════════════════════════════════════
+
+def build_ws_client():
+    """Construit le client WS public sans démarrer de décision de trading."""
+    return BitgetPublicWS(
+        SYMBOL,
+        url=WS_PUBLIC_URL,
+        inst_type=WS_INST_TYPE,
+        heartbeat_seconds=WS_HEARTBEAT_SECONDS,
+        reconnect_min_seconds=WS_RECONNECT_MIN_SECONDS,
+        reconnect_max_seconds=WS_RECONNECT_MAX_SECONDS,
+        logger=log,
+    )
+
+
+def wait_for_fresh_ws_market(ws_client, baseline_stats=None, timeout=None):
+    """Attend au moins un ticker + update 1m + update 5m postérieurs au baseline."""
+    timeout = WS_READY_TIMEOUT_SECONDS if timeout is None else float(timeout)
+    if baseline_stats is None:
+        baseline_stats = ws_client.health_snapshot().get("stats", {})
+    baseline = {
+        "ticker_updates": int(baseline_stats.get("ticker_updates", 0)),
+        "candle_1m_updates": int(baseline_stats.get("candle_1m_updates", 0)),
+        "candle_5m_updates": int(baseline_stats.get("candle_5m_updates", 0)),
+    }
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        snap = ws_client.health_snapshot()
+        stats = snap.get("stats", {})
+        fresh = all(int(stats.get(key, 0)) > value for key, value in baseline.items())
+        if snap.get("ready") and snap.get("healthy") and fresh:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def bootstrap_ws_market_data(ws_client):
+    """Bootstrap REST autoritaire puis démarrage WS, selon le contrat d'interface."""
+    candles_5m = exchange.get_candles(SYMBOL, INTERVAL_SIGNAL, CANDLES_5M + 10)
+    candles_1m = exchange.get_candles(SYMBOL, INTERVAL_CONFIRM, CANDLES_1M + 5)
+
+    if not candles_5m or len(candles_5m) < 50:
+        raise RuntimeError("Bootstrap WS refusé: historique 5m insuffisant")
+    if not candles_1m or len(candles_1m) < 2:
+        raise RuntimeError("Bootstrap WS refusé: historique 1m insuffisant")
+
+    ws_client.seed_candles("5m", candles_5m)
+    ws_client.seed_candles("1m", candles_1m)
+    ws_client.start()
+
+    if not ws_client.wait_until_ready(WS_READY_TIMEOUT_SECONDS):
+        snap = ws_client.health_snapshot()
+        ws_client.stop()
+        raise RuntimeError(f"WebSocket non prêt après {WS_READY_TIMEOUT_SECONDS}s: {snap}")
+    if not wait_for_fresh_ws_market(ws_client, baseline_stats={}):
+        snap = ws_client.health_snapshot()
+        ws_client.stop()
+        raise RuntimeError(f"WebSocket prêt mais données fraîches absentes: {snap}")
+
+    log.info(
+        "WebSocket cutover prêt | subscriptions=%s | live_price=%s",
+        ws_client.health_snapshot().get("subscriptions"),
+        ws_client.get_live_price(),
+    )
+    return candles_5m, candles_1m
+
+
+def resync_ws_market_data(ws_client):
+    """Resynchronisation REST 1m/5m après reconnexion/gap, avec recovery PAPER."""
+    # Une position ouverte impose d'abord le replay sûr des minutes manquées.
+    if state.position is not None:
+        recover_open_position_closed_rest()
+
+    candles_5m = exchange.get_candles(SYMBOL, INTERVAL_SIGNAL, CANDLES_5M + 10)
+    candles_1m = exchange.get_candles(SYMBOL, INTERVAL_CONFIRM, CANDLES_1M + 5)
+
+    if not candles_5m or len(candles_5m) < 50:
+        raise RuntimeError("Resync WS refusé: historique 5m insuffisant")
+    if not candles_1m or len(candles_1m) < 2:
+        raise RuntimeError("Resync WS refusé: historique 1m insuffisant")
+
+    ws_client.seed_candles("5m", candles_5m)
+    ws_client.seed_candles("1m", candles_1m)
+    baseline_stats = dict(ws_client.health_snapshot().get("stats", {}))
+
+    if not ws_client.is_ready() or not ws_client.is_healthy():
+        raise RuntimeError(f"Resync WS refusé: transport non sain {ws_client.health_snapshot()}")
+    if not wait_for_fresh_ws_market(ws_client, baseline_stats=baseline_stats):
+        raise RuntimeError(f"Resync WS refusé: aucune donnée fraîche post-seed {ws_client.health_snapshot()}")
+
+    if state.position is not None:
+        recover_open_position_ws_handoff(ws_client)
+
+    ws_client.mark_resynchronised()
+    log.warning("WebSocket resynchronisé par REST 1m/5m + recovery temporel")
+    return candles_5m, candles_1m
+
+
+def run_ws_startup_validation(ws_client, candles_5m_hist, candles_1m_hist):
+    """Gate live one-shot avant le premier remplacement Railway de la V4."""
+    if not WS_STARTUP_VALIDATION:
+        log.warning("12D STARTUP VALIDATION désactivée par configuration")
+        return candles_5m_hist, candles_1m_hist
+
+    if os.path.exists(WS_STARTUP_VALIDATION_MARKER_FILE):
+        log.info(f"12D STARTUP VALIDATION déjà validée: {WS_STARTUP_VALIDATION_MARKER_FILE}")
+        return candles_5m_hist, candles_1m_hist
+
+    if state.position is not None:
+        raise RuntimeError("12D startup validation exige un état FLAT au premier cutover")
+
+    start_snap = ws_client.health_snapshot()
+    start_stats = dict(start_snap.get("stats", {}))
+    base_closed_1m = int(start_stats.get("closed_1m", 0))
+    base_closed_5m = int(start_stats.get("closed_5m", 0))
+    deadline = time.monotonic() + float(WS_STARTUP_VALIDATION_TIMEOUT_SECONDS)
+
+    log.warning("12D STARTUP VALIDATION | attente clôture réelle 1m + 5m avant trading")
+    while time.monotonic() < deadline:
+        snap = ws_client.health_snapshot()
+        stats = snap.get("stats", {})
+        got_1m = int(stats.get("closed_1m", 0)) > base_closed_1m
+        got_5m = int(stats.get("closed_5m", 0)) > base_closed_5m
+        if snap.get("ready") and snap.get("healthy") and got_1m and got_5m:
+            break
+        time.sleep(0.25)
+    else:
+        raise RuntimeError(f"12D validation live: clôtures 1m/5m non observées: {ws_client.health_snapshot()}")
+
+    generation_before = int(ws_client.health_snapshot().get("connection_generation", 0))
+    if not ws_client.request_reconnect("12D startup validation"):
+        raise RuntimeError("12D validation live: reconnexion forcée impossible")
+
+    reconnect_deadline = time.monotonic() + float(WS_STARTUP_RECONNECT_TIMEOUT_SECONDS)
+    while time.monotonic() < reconnect_deadline:
+        snap = ws_client.health_snapshot()
+        generation = int(snap.get("connection_generation", 0))
+        if generation > generation_before and snap.get("ready") and snap.get("needs_resync"):
+            break
+        time.sleep(0.10)
+    else:
+        raise RuntimeError(f"12D validation live: reconnexion/resync flag non observé: {ws_client.health_snapshot()}")
+
+    candles_5m_hist, candles_1m_hist = resync_ws_market_data(ws_client)
+    final_snap = ws_client.health_snapshot()
+    if final_snap.get("needs_resync") or not final_snap.get("ready") or not final_snap.get("healthy"):
+        raise RuntimeError(f"12D validation live: transport final non sain: {final_snap}")
+
+    _atomic_write_json(WS_STARTUP_VALIDATION_MARKER_FILE, {
+        "validation_id": WS_STARTUP_VALIDATION_ID,
+        "validated_at": datetime.now(timezone.utc).isoformat(),
+        "connection_generation": final_snap.get("connection_generation"),
+        "stats": final_snap.get("stats", {}),
+    })
+    log.warning("12D STARTUP VALIDATION | PASS | clôtures 1m+5m + reconnexion + resync REST validées")
+    tg("✅ <b>12D WS CUTOVER</b> — validation Railway live PASS, trading PAPER autorisé.")
+    return candles_5m_hist, candles_1m_hist
+
+
+# ── Historique rapide WS ─────────────────────────────────────────
+def _apply_closed_candles(history, closed_candles, max_len):
+    """Intègre des clôtures WS sans doublon ni retour arrière."""
+    for candle in closed_candles:
+        if not candle:
+            continue
+        ts = int(candle.get("timestamp", 0))
+        if ts <= 0:
+            continue
+        if history:
+            last_ts = int(history[-1].get("timestamp", 0))
+            if ts < last_ts:
+                continue
+            if ts == last_ts:
+                history[-1] = candle
+                continue
+        history.append(candle)
+    if len(history) > max_len:
+        del history[:-max_len]
+
+
+def _market_view(history, current_candle, max_len):
+    """Retourne historique + bougie en formation sans muter l'historique fermé."""
+    view = list(history)
+    if current_candle:
+        ts = int(current_candle.get("timestamp", 0))
+        if ts > 0:
+            if view and int(view[-1].get("timestamp", 0)) == ts:
+                view[-1] = current_candle
+            elif not view or ts > int(view[-1].get("timestamp", 0)):
+                view.append(current_candle)
+    return view[-max_len:]
+
+
+def _fetch_htf_market_data():
+    """1h/4h restent REST pendant le chantier WebSocket."""
+    candles_1h = exchange.get_candles(SYMBOL, INTERVAL_HTF_1H, CANDLES_1H + 10)
+    candles_4h = exchange.get_candles(SYMBOL, INTERVAL_HTF_4H, CANDLES_4H + 10)
+    candles_dxy = []
+    if DXY_ENABLED:
+        try:
+            candles_dxy = exchange.get_candles(DXY_SYMBOL, INTERVAL_HTF_4H, CANDLES_4H + 10)
+        except Exception as e:
+            log.debug(f"DXY non disponible: {e}")
+    return candles_1h, candles_4h, candles_dxy
+
+
+# ════════════════════════════════════════════════════════
+# RECOVERY TEMPOREL PAPER — fenêtre marché manquée
+# ════════════════════════════════════════════════════════
+
+class MarketRecoveryError(RuntimeError):
+    """Le chemin marché manqué ne peut pas être reconstruit sans ambiguïté."""
+
+
+def _sorted_unique_1m(candles):
+    """Normalise l'ordre temporel et déduplique les bougies REST 1m."""
+    by_ts = {}
+    for candle in candles or []:
+        if not isinstance(candle, dict):
+            continue
+        try:
+            ts = int(candle.get("timestamp", 0))
+        except (TypeError, ValueError):
+            continue
+        if ts <= 0:
+            continue
+        by_ts[ts] = candle
+    return [by_ts[ts] for ts in sorted(by_ts)]
+
+
+def _classify_recovery_candle(pos, candle):
+    """
+    Classe une bougie 1m manquée pour une position PAPER.
+
+    `TP1` pendant une coupure est volontairement déclaré ambigu : une OHLC 1m
+    ne permet pas de savoir si, après le passage de TP1, le prix est revenu au
+    nouveau stop `sl_lot2` dans la même minute. On refuse donc d'inventer un
+    ordre intrabar.
+    """
+    if not pos or not candle:
+        return "NONE"
+
+    side = pos["side"]
+    high = float(candle.get("high", candle.get("close", 0.0)))
+    low = float(candle.get("low", candle.get("close", 0.0)))
+
+    if not pos.get("tp1_hit", False):
+        sl_hit = (side == "long" and low <= pos["sl"]) or (side == "short" and high >= pos["sl"])
+        tp1_hit = (side == "long" and high >= pos["tp1"]) or (side == "short" and low <= pos["tp1"])
+        if sl_hit and tp1_hit:
+            return "AMBIGUOUS_PHASE1_BOTH"
+        if tp1_hit:
+            return "AMBIGUOUS_TP1_INTRABAR"
+        if sl_hit:
+            return "SL"
+        return "NONE"
+
+    sl2_hit = (side == "long" and low <= pos["sl_lot2"]) or (side == "short" and high >= pos["sl_lot2"])
+    tp2_hit = (side == "long" and high >= pos["tp2"]) or (side == "short" and low <= pos["tp2"])
+    if sl2_hit and tp2_hit:
+        return "AMBIGUOUS_PHASE2_BOTH"
+    if sl2_hit:
+        return "SL2"
+    if tp2_hit:
+        return "TP2"
+    return "NONE"
+
+
+def _fetch_recovery_1m():
+    candles = exchange.get_candles(
+        SYMBOL, INTERVAL_CONFIRM, WS_RECOVERY_MAX_1M_CANDLES
+    )
+    candles = _sorted_unique_1m(candles)
+    if not candles:
+        raise MarketRecoveryError("recovery impossible: historique REST 1m vide")
+    return candles
+
+
+def recover_open_position_closed_rest(now_ms=None):
+    """
+    Rejoue uniquement les minutes REST déjà clôturées depuis le curseur persistant.
+    Retourne True si le recovery est sûr. Toute ambiguïté déclenche un fail-safe.
+    """
+    if state.position is None:
+        return True
+    if state.loaded_state_version != STATE_VERSION:
+        raise MarketRecoveryError(
+            f"position ouverte issue du schéma v{state.loaded_state_version}: recovery v3 impossible"
+        )
+    if state.last_processed_market_ts_ms <= 0:
+        raise MarketRecoveryError("position ouverte sans last_processed_market_ts_ms valide")
+
+    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    candles = _fetch_recovery_1m()
+    first_start_ms = int(candles[0]["timestamp"]) * 1000
+    cursor = int(state.last_processed_market_ts_ms)
+    if cursor < first_start_ms:
+        raise MarketRecoveryError(
+            f"fenêtre recovery non couverte: cursor={cursor} earliest_1m={first_start_ms}"
+        )
+
+    processed = 0
+    for candle in candles:
+        start_ms = int(candle["timestamp"]) * 1000
+        end_ms = start_ms + 60_000
+        if end_ms <= cursor:
+            continue
+        if end_ms > now_ms:
+            break  # minute en formation : traitée au handoff WS, pas ici
+
+        action = _classify_recovery_candle(state.position, candle)
+        if action.startswith("AMBIGUOUS_"):
+            raise MarketRecoveryError(
+                f"recovery intrabar ambigu {action} @ {start_ms} pour {state.position['trade_id']}"
+            )
+
+        # Le curseur est avancé AVANT toute transition : si check_exits persiste
+        # une clôture, le snapshot position+curseur reste atomiquement cohérent.
+        state.last_processed_market_ts_ms = end_ms
+        state.last_price = float(candle.get("close", state.last_price))
+
+        if action in {"SL", "SL2", "TP2"}:
+            check_exits(state.last_price, candle, phase2_use_extremes=True)
+
+        processed += 1
+        cursor = end_ms
+        if state.position is None:
+            break
+
+    if processed:
+        if not save_state():
+            raise MarketRecoveryError("recovery calculé mais persistance impossible")
+        log.warning(
+            "Recovery REST 1m appliqué | minutes=%s | cursor=%s | position=%s",
+            processed,
+            state.last_processed_market_ts_ms,
+            state.position["trade_id"] if state.position else "FLAT",
+        )
+    return True
+
+
+def recover_open_position_ws_handoff(ws_client):
+    """
+    Ferme la fenêtre entre la dernière minute REST clôturée et le premier ticker WS.
+    Aucun tick normal n'est accepté tant que ce handoff n'est pas validé.
+    """
+    if state.position is None:
+        return True
+
+    snap = ws_client.health_snapshot()
+    market_ts_ms = snap.get("ticker_exchange_ts_ms")
+    current_1m = ws_client.get_current_candle("1m")
+    if not market_ts_ms or current_1m is None:
+        raise MarketRecoveryError("handoff WS sans ticker horodaté ou bougie 1m courante")
+
+    market_ts_ms = int(market_ts_ms)
+    start_ms = int(current_1m.get("timestamp", 0)) * 1000
+    if start_ms <= 0:
+        raise MarketRecoveryError("handoff WS: timestamp 1m invalide")
+    if state.last_processed_market_ts_ms < start_ms:
+        raise MarketRecoveryError(
+            f"handoff WS avec trou temporel: cursor={state.last_processed_market_ts_ms} current_1m={start_ms}"
+        )
+    if market_ts_ms <= state.last_processed_market_ts_ms:
+        return True
+
+    action = _classify_recovery_candle(state.position, current_1m)
+    if action.startswith("AMBIGUOUS_"):
+        raise MarketRecoveryError(
+            f"handoff intrabar ambigu {action} @ {start_ms} pour {state.position['trade_id']}"
+        )
+
+    state.last_processed_market_ts_ms = market_ts_ms
+    live_price = ws_client.get_live_price()
+    if live_price is not None:
+        state.last_price = float(live_price)
+
+    if action in {"SL", "SL2", "TP2"}:
+        check_exits(state.last_price, current_1m, phase2_use_extremes=True)
+
+    if not save_state():
+        raise MarketRecoveryError("handoff WS validé mais persistance impossible")
+    log.warning(
+        "Recovery handoff WS validé | cursor=%s | position=%s",
+        state.last_processed_market_ts_ms,
+        state.position["trade_id"] if state.position else "FLAT",
+    )
+    return True
+
+
+# ── Snapshot pré-cutover ───────────────────────────────────────
+def snapshot_pre_ws_cutover_state():
+    """Conserve une copie one-shot de l'état présent avant la migration WS v3."""
+    for source, target in (
+        (STATE_FILE, PRE_WS_CUTOVER_STATE_FILE),
+        (STATE_BACKUP_FILE, PRE_WS_CUTOVER_BACKUP_FILE),
+    ):
+        if os.path.exists(source) and not os.path.exists(target):
+            try:
+                shutil.copy2(source, target)
+                with open(target, "rb+") as f:
+                    os.fsync(f.fileno())
+                _fsync_directory(target)
+                log.warning(f"Snapshot pré-WS conservé: {target}")
+            except Exception as e:
+                raise RuntimeError(f"snapshot pré-cutover impossible ({source}): {e}") from e
+
+
 # ── Persistance état ────────────────────────────────────────────
 def _json_safe(value):
     """Convertit récursivement les scalaires non natifs (ex. NumPy) en types JSON."""
@@ -218,6 +637,7 @@ def _state_payload():
         "state_version":   STATE_VERSION,
         "position":        position,
         "last_price":      state.last_price,
+        "last_processed_market_ts_ms": state.last_processed_market_ts_ms,
         "paper_balance":   state.paper_balance,
         "paper_pnl":       state.paper_pnl,
         "peak_capital":    state.peak_capital,
@@ -273,9 +693,17 @@ def _validate_state_dict(d):
         if key in d and (isinstance(d[key], bool) or not isinstance(d[key], (int, float))):
             raise ValueError(f"champ {key} invalide")
 
+    if "state_version" in d and (
+        isinstance(d["state_version"], bool)
+        or not isinstance(d["state_version"], int)
+        or d["state_version"] <= 0
+    ):
+        raise ValueError("state_version invalide")
+
     int_fields = (
         "dd_level", "consec_losses", "wins", "losses", "total_trades",
         "trade_counter", "daily_trades", "daily_wins", "daily_losses",
+        "last_processed_market_ts_ms",
     )
     for key in int_fields:
         if key in d and (isinstance(d[key], bool) or not isinstance(d[key], int) or d[key] < 0):
@@ -319,6 +747,12 @@ def _validate_state_dict(d):
         if not isinstance(position["tp1_hit"], bool):
             raise ValueError("tp1_hit invalide")
 
+    version = d.get("state_version", 1)
+    if version >= 3 and "last_processed_market_ts_ms" not in d:
+        raise ValueError("curseur marché v3 absent")
+    if position is not None and version >= 3 and d.get("last_processed_market_ts_ms", 0) <= 0:
+        raise ValueError("position v3 ouverte sans curseur marché")
+
     return d
 
 
@@ -333,6 +767,7 @@ def save_state():
         _validate_state_dict(payload)
         _atomic_write_json(STATE_FILE, payload)
         _atomic_write_json(STATE_BACKUP_FILE, payload)
+        state.loaded_state_version = STATE_VERSION
         return True
     except Exception as e:
         log.error(f"save_state: {e}", exc_info=True)
@@ -340,6 +775,8 @@ def save_state():
 
 
 def _apply_state(d):
+    state.loaded_state_version = d.get("state_version", 1)
+    state.last_processed_market_ts_ms = d.get("last_processed_market_ts_ms", 0)
     state.paper_balance  = d.get("paper_balance",  float(CAPITAL))
     state.paper_pnl      = d.get("paper_pnl",      0.0)
     state.peak_capital   = d.get("peak_capital",   float(CAPITAL))
@@ -381,12 +818,20 @@ def load_state():
         try:
             d = _read_valid_state(path)
             _apply_state(d)
+            loaded_version = d.get("state_version", 1)
+            if loaded_version != STATE_VERSION and state.position is not None:
+                raise ValueError(
+                    f"migration v{loaded_version}->v{STATE_VERSION} refusée avec position ouverte"
+                )
             if label == "backup":
                 log.warning("État principal indisponible/invalide — backup restauré")
-                save_state()
-            elif d.get("state_version") != STATE_VERSION or not os.path.exists(STATE_BACKUP_FILE):
+                if not save_state():
+                    raise ValueError("restauration backup non persistable")
+            elif loaded_version != STATE_VERSION or not os.path.exists(STATE_BACKUP_FILE):
                 log.info("Migration/initialisation du schéma de persistance")
-                save_state()
+                state.loaded_state_version = STATE_VERSION
+                if not save_state():
+                    raise ValueError("migration persistance impossible")
             log.info(
                 f"État chargé ({label}) | Capital: ${state.paper_balance:.2f} | "
                 f"Trades: {state.total_trades} | WR: {state.wr:.0f}% | "
@@ -631,7 +1076,7 @@ def open_position(signal, risk_pct):
 # GESTION DES SORTIES
 # ════════════════════════════════════════════════════════
 
-def check_exits(current_price, last_1m_candle):
+def check_exits(current_price, last_1m_candle, *, phase2_use_extremes=False):
     """
     Gestion complète des sorties pour 1 position avec fermeture partielle.
 
@@ -708,10 +1153,15 @@ def check_exits(current_price, last_1m_candle):
 
     # ── Phase 2 — TP1 atteint, lot_tp2 en cours ──────────────────
     else:
-        sl2_hit = (side == "long"  and l  <= pos["sl_lot2"]) or \
-                  (side == "short" and h  >= pos["sl_lot2"])
-        tp2_hit = (side == "long"  and h  >= pos["tp2"]) or \
-                  (side == "short" and l  <= pos["tp2"])
+        # En temps réel, ne jamais réutiliser le high/low de toute la minute après
+        # le passage de TP1 : ces extrêmes peuvent précéder l'activation du SL2.
+        # Le recovery REST demande explicitement les extrêmes via phase2_use_extremes.
+        phase2_high = h if phase2_use_extremes else current_price
+        phase2_low  = l if phase2_use_extremes else current_price
+        sl2_hit = (side == "long"  and phase2_low  <= pos["sl_lot2"]) or \
+                  (side == "short" and phase2_high >= pos["sl_lot2"])
+        tp2_hit = (side == "long"  and phase2_high >= pos["tp2"]) or \
+                  (side == "short" and phase2_low  <= pos["tp2"])
 
         if sl2_hit:
             # SL lot2 touché au breakeven → gain nul sur ce lot
@@ -799,30 +1249,65 @@ def refresh_htf_maps(candles_4h, candles_1h, candles_dxy_4h):
 
 def main():
     log.info("=" * 65)
-    log.info("  VP+VWAP+DELTA+MTF SCALPER V4 [BITGET] — Sans EMA · DXY 4h")
+    log.info("  VP+VWAP+DELTA+MTF SCALPER V4 [BITGET] — WS CUTOVER 12D")
     log.info(f"  {SYMBOL} · Capital config: ${CAPITAL} · Levier: {LEVERAGE}x")
-    log.info(f"  MTF: 4h(Liq+OB+DXY) / 1h(Struct+Sweep) / 5m(Signal) / 1m(Confirm)")
-    log.info(f"  1 position · Fermeture partielle TP1(2/3)+TP2(1/3)")
-    log.info(f"  DD 4 niveaux (20% max) · Lot max:{LOT_MAX} · Marge max:{MARGIN_CAP*100:.0f}%")
+    log.info(f"  WS: ticker + 1m + 5m | REST: 1h + 4h | STATE v{STATE_VERSION}")
     log.info(f"  Mode: {'📄 PAPER' if PAPER_MODE else '💰 LIVE FUTURES'}")
     log.info("=" * 65)
+
+    try:
+        snapshot_pre_ws_cutover_state()
+    except Exception as e:
+        log.critical(f"Démarrage refusé — snapshot pré-cutover: {e}", exc_info=True)
+        tg(f"🛑 <b>CUTOVER WS</b> — snapshot état impossible: {e}")
+        return
 
     if not load_state():
         log.critical("Démarrage trading refusé : état persistant non restaurable")
         tg("🛑 <b>PERSISTANCE</b> — état principal et backup invalides/absents. Trading non démarré.")
         return
 
+    if not WS_ENABLED:
+        log.critical("WS staging désactivé : aucun fallback silencieux vers polling 1m/5m")
+        tg("🛑 <b>WEBSOCKET CUTOVER</b> — WS_ENABLED=false, trading non démarré.")
+        return
+
+    # Avant même d'ouvrir le transport WS, reconstruire les minutes clôturées
+    # manquées si une position PAPER est restaurée.
+    if state.position is not None:
+        try:
+            recover_open_position_closed_rest()
+        except MarketRecoveryError as e:
+            log.critical(f"Démarrage refusé — recovery temporel: {e}")
+            tg(f"🛑 <b>RECOVERY PAPER</b> — démarrage refusé: {e}")
+            return
+
+    ws_client = build_ws_client()
+    try:
+        candles_5m_hist, candles_1m_hist = bootstrap_ws_market_data(ws_client)
+        candles_5m_hist, candles_1m_hist = run_ws_startup_validation(
+            ws_client, candles_5m_hist, candles_1m_hist
+        )
+    except Exception as e:
+        ws_client.stop()
+        log.critical(f"Démarrage WS cutover refusé: {e}", exc_info=True)
+        tg(f"🛑 <b>WEBSOCKET CUTOVER</b> — démarrage refusé: {e}")
+        return
+
+    # Handoff final REST -> WS : aucune décision/tick normal avant validation.
+    if state.position is not None:
+        try:
+            recover_open_position_ws_handoff(ws_client)
+        except MarketRecoveryError as e:
+            ws_client.stop()
+            log.critical(f"Démarrage refusé — handoff recovery WS: {e}")
+            tg(f"🛑 <b>RECOVERY PAPER</b> — handoff WS refusé: {e}")
+            return
+
     try:
         info = exchange.get_contract_info(SYMBOL)
         state.contract_size = info["contractSize"]
         log.info(f"1 contrat = {state.contract_size} oz XAU")
-        tg(
-            f"🤖 <b>VP+VWAP+Delta+MTF Scalper V4</b>\n"
-            f"{SYMBOL} · {LEVERAGE}x · Capital état: ${state.paper_balance:.2f}\n"
-            f"MTF 4h/1h/5m/1m · Sans EMA · DXY: {'✅' if DXY_ENABLED else '⏸️'}\n"
-            f"DD max 20% · Lot max {LOT_MAX} · Marge {MARGIN_CAP*100:.0f}%\n"
-            f"{'📄 PAPER MODE' if PAPER_MODE else '💰 LIVE'}"
-        )
     except Exception as e:
         log.warning(f"contract_size=0.01 par défaut ({e})")
 
@@ -833,111 +1318,151 @@ def main():
         except Exception as e:
             log.warning(f"Levier: {e}")
 
-    while True:
-        try:
-            state.reset_daily()
+    candles_1h, candles_4h, candles_dxy = _fetch_htf_market_data()
+    refresh_htf_maps(candles_4h, candles_1h, candles_dxy)
 
-            # ── Fermeture weekend ─────────────────────────────────
-            if is_weekend_close_time():
-                close_weekend()
-                time.sleep(LOOP_SECONDS)
-                continue
+    next_signal_eval = 0.0
+    next_htf_refresh = 0.0
 
-            # ── DD Protection ─────────────────────────────────────
-            if not check_drawdown():
-                time.sleep(LOOP_SECONDS)
-                continue
+    try:
+        while True:
+            try:
+                state.reset_daily()
 
-            # ── Fetch données ─────────────────────────────────────
-            candles_5m = exchange.get_candles(SYMBOL, INTERVAL_SIGNAL,  CANDLES_5M + 10)
-            candles_1m = exchange.get_candles(SYMBOL, INTERVAL_CONFIRM, CANDLES_1M + 5)
-            candles_1h = exchange.get_candles(SYMBOL, INTERVAL_HTF_1H,  CANDLES_1H + 10)
-            candles_4h = exchange.get_candles(SYMBOL, INTERVAL_HTF_4H,  CANDLES_4H + 10)
+                # Le transport doit être prêt, sain et alimenté avant toute décision.
+                if not ws_client.is_ready() or not ws_client.is_healthy():
+                    time.sleep(WS_CONSUMER_SLEEP_SECONDS)
+                    continue
 
-            # DXY — désactivé si symbole non disponible sur Bitget
-            candles_dxy = []
-            if DXY_ENABLED:
-                try:
-                    candles_dxy = exchange.get_candles(DXY_SYMBOL, INTERVAL_HTF_4H, CANDLES_4H + 10)
-                except Exception as e:
-                    log.debug(f"DXY non disponible: {e}")
+                # Reconnexion/gap : REST autoritaire puis reprise, sans replay.
+                if ws_client.needs_resync():
+                    try:
+                        candles_5m_hist, candles_1m_hist = resync_ws_market_data(ws_client)
+                    except MarketRecoveryError as e:
+                        log.critical(f"Trading arrêté — recovery après resync impossible: {e}")
+                        tg(f"🛑 <b>RECOVERY PAPER</b> — resync impossible: {e}")
+                        break
 
-            if not candles_5m or len(candles_5m) < 50:
-                log.warning("Bougies 5m insuffisantes")
-                time.sleep(30)
-                continue
+                data_age = ws_client.last_data_age()
+                if data_age is None or data_age > WS_MAX_DATA_AGE_SECONDS:
+                    log.warning(f"WS data stale: age={data_age}")
+                    time.sleep(WS_CONSUMER_SLEEP_SECONDS)
+                    continue
 
-            current_price    = candles_5m[-1]["close"]
-            state.last_price = current_price
-
-            # ── Mise à jour cartes MTF ────────────────────────────
-            refresh_htf_maps(candles_4h, candles_1h, candles_dxy)
-
-            # ── Sorties ───────────────────────────────────────────
-            if state.position:
-                last_1m = candles_1m[-1] if candles_1m else None
-                check_exits(current_price, last_1m)
-
-            # ── Signal ───────────────────────────────────────────
-            signal = {"signal": None, "reason": "–"}
-
-            if state.position is None:
-                risk_pct, score_malus, _ = get_dd_params()
-
-                signal = calc_signal(
-                    candles_5m, candles_1m,
-                    candles_1h, candles_4h, candles_dxy,
-                    state.liq_map, state.ob_map,
-                    state.sweep_map, state.struct_map, state.dxy_map
+                # Les seules clôtures rapides viennent désormais du WebSocket.
+                _apply_closed_candles(
+                    candles_1m_hist,
+                    ws_client.drain_closed_candles("1m"),
+                    CANDLES_1M + 5,
+                )
+                _apply_closed_candles(
+                    candles_5m_hist,
+                    ws_client.drain_closed_candles("5m"),
+                    CANDLES_5M + 10,
                 )
 
-                if signal.get("signal"):
-                    side_sig = signal["signal"]
+                current_1m = ws_client.get_current_candle("1m")
+                current_5m = ws_client.get_current_candle("5m")
+                candles_1m = _market_view(candles_1m_hist, current_1m, CANDLES_1M + 5)
+                candles_5m = _market_view(candles_5m_hist, current_5m, CANDLES_5M + 10)
 
-                    # Filtre score DD
-                    min_score_eff = MIN_SCORE + score_malus
-                    if signal.get("score", 0) < min_score_eff:
-                        signal = {"signal": None,
-                                  "reason": f"DD N{state.dd_level} score {signal['score']:.1f}<{min_score_eff:.1f}"}
+                current_price = ws_client.get_live_price()
+                market_ts_ms = ws_client.health_snapshot().get("ticker_exchange_ts_ms")
+                if current_price is None or not market_ts_ms:
+                    time.sleep(WS_CONSUMER_SLEEP_SECONDS)
+                    continue
+                market_ts_ms = int(market_ts_ms)
+                if market_ts_ms <= state.last_processed_market_ts_ms:
+                    time.sleep(WS_CONSUMER_SLEEP_SECONDS)
+                    continue
 
-                    # Filtre cooldown
-                    elif state.cooldown_remaining(side_sig) > 0:
-                        cd = state.cooldown_remaining(side_sig)
-                        signal = {"signal": None,
-                                  "reason": f"Cooldown {side_sig.upper()}: {int(cd/60)}m{int(cd%60):02d}s"}
+                state.last_price = current_price
+                # Avancer le curseur AVANT une éventuelle sortie qui appelle save_state().
+                state.last_processed_market_ts_ms = market_ts_ms
 
-                    else:
-                        open_position(signal, risk_pct)
+                # Phase 1 peut utiliser les extrêmes de la 1m courante. Phase 2 utilise
+                # uniquement le prix live afin de ne pas recycler un low/high antérieur à TP1.
+                if state.position:
+                    check_exits(current_price, current_1m, phase2_use_extremes=False)
 
-            # ── Log boucle ────────────────────────────────────────
-            if state.position:
-                pos = state.position
-                ph  = "Ph2" if pos["tp1_hit"] else "Ph1"
-                pos_desc = (f"{pos['side'].upper()}[{pos['setup']}]"
-                            f"@${pos['entry']:.1f} {ph}")
-            else:
-                pos_desc = "FLAT"
+                # Fermeture weekend reste prioritaire pour toute position restante.
+                if is_weekend_close_time():
+                    close_weekend()
+                    time.sleep(WS_CONSUMER_SLEEP_SECONDS)
+                    continue
 
-            dd_pct   = (state.peak_capital - state.capital) / state.peak_capital * 100
-            dd_label = ["", "DD⚠️", "DD🟠", "DD🔴", "DD🛑"][min(state.dd_level, 4)]
+                now_mono = time.monotonic()
+                if now_mono < next_signal_eval:
+                    time.sleep(WS_CONSUMER_SLEEP_SECONDS)
+                    continue
+                next_signal_eval = now_mono + LOOP_SECONDS
 
-            log.info(
-                f"${current_price:.2f} | {pos_desc} | "
-                f"Cap:${state.paper_balance:.2f} | P&L:{state.paper_pnl:+.2f}$ | "
-                f"WR:{state.wr:.0f}% | DD:{dd_pct:.1f}%{dd_label} | "
-                f"{signal.get('reason', '–')}"
-            )
+                # Les couches 1h/4h restent REST, à la cadence historique de la V4.
+                if now_mono >= next_htf_refresh:
+                    candles_1h, candles_4h, candles_dxy = _fetch_htf_market_data()
+                    refresh_htf_maps(candles_4h, candles_1h, candles_dxy)
+                    next_htf_refresh = now_mono + LOOP_SECONDS
 
-        except KeyboardInterrupt:
-            log.info("Bot arrêté manuellement")
-            break
-        except Exception as e:
-            log.error(f"Erreur boucle: {e}", exc_info=True)
-            time.sleep(30)
-            continue
+                signal = {"signal": None, "reason": "–"}
 
+                # DD bloque les nouvelles entrées, pas la gestion d'une position existante.
+                trading_allowed = check_drawdown()
+                if trading_allowed and state.position is None:
+                    risk_pct, score_malus, _ = get_dd_params()
+
+                    signal = calc_signal(
+                        candles_5m, candles_1m,
+                        candles_1h, candles_4h, candles_dxy,
+                        state.liq_map, state.ob_map,
+                        state.sweep_map, state.struct_map, state.dxy_map
+                    )
+
+                    if signal.get("signal"):
+                        side_sig = signal["signal"]
+                        min_score_eff = MIN_SCORE + score_malus
+                        if signal.get("score", 0) < min_score_eff:
+                            signal = {
+                                "signal": None,
+                                "reason": f"DD N{state.dd_level} score {signal['score']:.1f}<{min_score_eff:.1f}",
+                            }
+                        elif state.cooldown_remaining(side_sig) > 0:
+                            cd = state.cooldown_remaining(side_sig)
+                            signal = {
+                                "signal": None,
+                                "reason": f"Cooldown {side_sig.upper()}: {int(cd/60)}m{int(cd%60):02d}s",
+                            }
+                        else:
+                            open_position(signal, risk_pct)
+
+                if state.position:
+                    pos = state.position
+                    ph = "Ph2" if pos["tp1_hit"] else "Ph1"
+                    pos_desc = f"{pos['side'].upper()}[{pos['setup']}]@${pos['entry']:.1f} {ph}"
+                else:
+                    pos_desc = "FLAT"
+
+                dd_pct = (state.peak_capital - state.capital) / state.peak_capital * 100
+                dd_label = ["", "DD⚠️", "DD🟠", "DD🔴", "DD🛑"][min(state.dd_level, 4)]
+                log.info(
+                    f"${current_price:.2f} | {pos_desc} | "
+                    f"Cap:${state.paper_balance:.2f} | P&L:{state.paper_pnl:+.2f}$ | "
+                    f"WR:{state.wr:.0f}% | DD:{dd_pct:.1f}%{dd_label} | "
+                    f"WS age:{data_age:.2f}s | {signal.get('reason', '–')}"
+                )
+                save_state()
+
+            except KeyboardInterrupt:
+                log.info("Bot arrêté manuellement")
+                break
+            except Exception as e:
+                log.error(f"Erreur boucle WS: {e}", exc_info=True)
+                time.sleep(1.0)
+
+            time.sleep(WS_CONSUMER_SLEEP_SECONDS)
+    finally:
+        ws_client.stop()
         save_state()
-        time.sleep(LOOP_SECONDS)
+        log.info("WebSocket cutover arrêté proprement")
 
 
 if __name__ == "__main__":
