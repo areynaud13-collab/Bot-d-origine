@@ -34,6 +34,7 @@ from strategy import (
 import bitget as exchange
 import dashboard
 from bitget_ws import BitgetPublicWS
+from entry_shadow import EntryShadowLab
 
 STATE_FILE = "/data/bot_state.json"
 STATE_BACKUP_FILE = "/data/bot_state.backup.json"
@@ -1244,6 +1245,161 @@ def refresh_htf_maps(candles_4h, candles_1h, candles_dxy_4h):
 
 
 # ════════════════════════════════════════════════════════
+# 13A — LABORATOIRE SHADOW ENTRÉE 1M (NON BLOQUANT)
+# ════════════════════════════════════════════════════════
+
+def _shadow_level_from_signal(signal):
+    """
+    Reconstruit le niveau technique du setup SANS modifier strategy.py.
+
+    La stratégie actuelle calcule déjà ce niveau pour ses SL :
+    - VP / POC / VAH : SL à ATR_SL du niveau ;
+    - VWAP ±2SD      : SL à 0.8 * ATR_SL du niveau ;
+    - TF1-VWAP       : le VWAP central est déjà retourné dans le signal.
+
+    Cette reconstruction sert uniquement au laboratoire shadow.
+    Elle n'est jamais utilisée par open_position() ni par la stratégie live/PAPER.
+    """
+    try:
+        setup = str(signal.get("setup", ""))
+        side = str(signal.get("signal", "")).lower()
+        if side not in {"long", "short"}:
+            return None, "invalid_side"
+
+        if setup == "TF1-VWAP":
+            level = signal.get("vwap")
+            if level is None:
+                return None, "missing_vwap"
+            return round(float(level), 2), "signal_vwap"
+
+        sl = signal.get("sl")
+        atr = signal.get("atr")
+        if sl is None or atr is None:
+            return None, "missing_sl_atr"
+
+        sl = float(sl)
+        atr = float(atr)
+        if atr <= 0:
+            return None, "invalid_atr"
+
+        standard_level_setups = {
+            "VAL->POC", "POC->VAH", "VAH->POC", "POC->VAL", "TF2-POC",
+        }
+        sd_level_setups = {"VWAP-2SD", "VWAP+2SD"}
+
+        if setup in standard_level_setups:
+            multiplier = 1.0
+            source = "sl_atr_reconstructed"
+        elif setup in sd_level_setups:
+            multiplier = 0.8
+            source = "sl_atr08_reconstructed"
+        else:
+            return None, f"unsupported_setup:{setup}"
+
+        offset = atr * ATR_SL * multiplier
+        level = sl + offset if side == "long" else sl - offset
+        return round(level, 2), source
+
+    except Exception as exc:
+        log.warning("SHADOW niveau non résolu: %s", exc)
+        return None, "resolver_error"
+
+
+def _shadow_history_through(history, max_start_ts):
+    """Vue historique sans look-ahead, bornée au timestamp de début indiqué."""
+    try:
+        cutoff = int(max_start_ts)
+    except (TypeError, ValueError):
+        return []
+    return [
+        candle for candle in history
+        if int(candle.get("timestamp", 0) or 0) <= cutoff
+    ]
+
+
+def _shadow_register_closed_5m(
+    shadow,
+    closed_5m_events,
+    candles_5m_hist,
+    candles_1m_hist,
+    candles_1h,
+    candles_4h,
+    candles_dxy,
+    *,
+    bid=None,
+    ask=None,
+    live_price=None,
+):
+    """
+    Évalue chaque NOUVELLE 5m clôturée pour le laboratoire 13A.
+
+    Important : cette fonction ne touche jamais state.position et n'appelle jamais
+    open_position(). Toute exception shadow est absorbée ici pour que le trading
+    PAPER actuel reste strictement indépendant du laboratoire.
+    """
+    if not closed_5m_events:
+        return
+
+    try:
+        events = sorted(
+            closed_5m_events,
+            key=lambda c: int(c.get("timestamp", 0) or 0),
+        )
+
+        for closed_5m in events:
+            bar_ts = int(closed_5m.get("timestamp", 0) or 0)
+            if bar_ts <= 0:
+                continue
+
+            # La vue 5m se termine exactement sur la bougie qui vient de clôturer.
+            shadow_5m = _shadow_history_through(candles_5m_hist, bar_ts)
+
+            # À la validation de la 5m (bar_ts + 300), seules les 1m dont la
+            # clôture est <= cette heure sont autorisées. Pour une bougie 1m,
+            # timestamp = début, donc dernier début admissible = bar_ts + 240.
+            shadow_1m = _shadow_history_through(candles_1m_hist, bar_ts + 240)
+
+            shadow_signal = calc_signal(
+                shadow_5m, shadow_1m,
+                candles_1h, candles_4h, candles_dxy,
+                state.liq_map, state.ob_map,
+                state.sweep_map, state.struct_map, state.dxy_map,
+            )
+
+            if not shadow_signal.get("signal"):
+                continue
+
+            level_price, level_source = _shadow_level_from_signal(shadow_signal)
+            if level_price is None:
+                log.warning(
+                    "SHADOW SKIP | %s %s | niveau non résolu (%s)",
+                    str(shadow_signal.get("signal", "?")).upper(),
+                    shadow_signal.get("setup", "UNKNOWN"),
+                    level_source,
+                )
+                continue
+
+            # Contexte analytique uniquement : n'influence aucun filtre du bot.
+            shadow_payload = dict(shadow_signal)
+            shadow_payload["shadow_level_source"] = level_source
+            shadow_payload["shadow_dd_level"] = state.dd_level
+            shadow_payload["shadow_position_open"] = state.position is not None
+
+            shadow.register_setup(
+                shadow_payload,
+                level_price=level_price,
+                validated_at=bar_ts + 300,
+                signal_bar_ts=bar_ts,
+                bid=bid,
+                ask=ask,
+                live_price=live_price,
+            )
+
+    except Exception as exc:
+        log.warning("SHADOW 13A | calcul 5m ignoré: %s", exc, exc_info=True)
+
+
+# ════════════════════════════════════════════════════════
 # BOUCLE PRINCIPALE
 # ════════════════════════════════════════════════════════
 
@@ -1321,6 +1477,13 @@ def main():
     candles_1h, candles_4h, candles_dxy = _fetch_htf_market_data()
     refresh_htf_maps(candles_4h, candles_1h, candles_dxy)
 
+    # 13A : laboratoire d'entrée 1m strictement observationnel.
+    shadow = EntryShadowLab(log)
+    log.info(
+        "SHADOW 13A | actif NON BLOQUANT | TTL=2/3/5 | log=%s",
+        shadow.jsonl_path,
+    )
+
     next_signal_eval = 0.0
     next_htf_refresh = 0.0
 
@@ -1350,14 +1513,19 @@ def main():
                     continue
 
                 # Les seules clôtures rapides viennent désormais du WebSocket.
+                # On conserve les événements AVANT de les injecter dans l'historique
+                # afin que le laboratoire 13A puisse les observer exactement une fois.
+                closed_1m_events = ws_client.drain_closed_candles("1m")
+                closed_5m_events = ws_client.drain_closed_candles("5m")
+
                 _apply_closed_candles(
                     candles_1m_hist,
-                    ws_client.drain_closed_candles("1m"),
+                    closed_1m_events,
                     CANDLES_1M + 5,
                 )
                 _apply_closed_candles(
                     candles_5m_hist,
-                    ws_client.drain_closed_candles("5m"),
+                    closed_5m_events,
                     CANDLES_5M + 10,
                 )
 
@@ -1367,7 +1535,33 @@ def main():
                 candles_5m = _market_view(candles_5m_hist, current_5m, CANDLES_5M + 10)
 
                 current_price = ws_client.get_live_price()
+                best_bid, best_ask = ws_client.get_best_bid_ask()
                 market_ts_ms = ws_client.health_snapshot().get("ticker_exchange_ts_ms")
+
+                # 13A — ORDRE TEMPOREL IMPORTANT :
+                # 1) les 1m qui viennent de clôturer ne peuvent agir que sur les
+                #    setups déjà pending AVANT cette clôture ;
+                # 2) ensuite seulement la nouvelle 5m clôturée peut créer un pending.
+                # Ainsi la dernière 1m contenue dans la 5m de signal ne peut jamais
+                # devenir artificiellement son propre trigger.
+                for closed_1m in closed_1m_events:
+                    shadow.on_closed_1m(
+                        closed_1m,
+                        bid=best_bid,
+                        ask=best_ask,
+                        live_price=current_price,
+                    )
+
+                _shadow_register_closed_5m(
+                    shadow,
+                    closed_5m_events,
+                    candles_5m_hist, candles_1m_hist,
+                    candles_1h, candles_4h, candles_dxy,
+                    bid=best_bid, ask=best_ask, live_price=current_price,
+                )
+
+                # Le shadow est traité avant ce gate pour ne jamais perdre un événement
+                # de clôture déjà drainé si le ticker n'a pas encore avancé son curseur.
                 if current_price is None or not market_ts_ms:
                     time.sleep(WS_CONSUMER_SLEEP_SECONDS)
                     continue
