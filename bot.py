@@ -152,6 +152,7 @@ class State:
         self.peak_capital    = float(CAPITAL)
         self.dd_level        = 0          # 0=normal 1=jaune 2=orange 3=rouge 4=stop
         self.dd_pause_until  = 0
+        self.dd_last_loss_bar_ts = 0      # Barre 5m du dernier SL en DD N2/N3
         self.consec_losses   = 0          # Compteur pertes consécutives
         # Cooldown directionnel
         self.last_sl_long    = 0.0
@@ -211,13 +212,10 @@ class State:
             return self.paper_balance
 
     def cooldown_remaining(self, side):
-        cd = DD_COOLDOWN_N
-        if self.dd_level == 1: cd = DD_COOLDOWN_Y
-        elif self.dd_level == 2: cd = DD_COOLDOWN_O
-        elif self.dd_level >= 3: cd = DD_COOLDOWN_R
+        """Cooldown directionnel après SL uniquement — indépendant du niveau de DD."""
         base = COOLDOWN_AFTER_SL_LONG if side == "long" else COOLDOWN_AFTER_SL_SHORT
         elapsed = time.time() - (self.last_sl_long if side=="long" else self.last_sl_short)
-        return max(0, max(base, cd) - elapsed)
+        return max(0, base - elapsed)
 
 
 state  = State()
@@ -668,6 +666,7 @@ def _state_payload():
         "peak_capital":    state.peak_capital,
         "dd_level":        state.dd_level,
         "dd_pause_until":  state.dd_pause_until,
+        "dd_last_loss_bar_ts": state.dd_last_loss_bar_ts,
         "consec_losses":   state.consec_losses,
         "wins":            state.wins,
         "losses":          state.losses,
@@ -728,7 +727,7 @@ def _validate_state_dict(d):
     int_fields = (
         "dd_level", "consec_losses", "wins", "losses", "total_trades",
         "trade_counter", "daily_trades", "daily_wins", "daily_losses",
-        "last_processed_market_ts_ms",
+        "last_processed_market_ts_ms", "dd_last_loss_bar_ts",
     )
     for key in int_fields:
         if key in d and (isinstance(d[key], bool) or not isinstance(d[key], int) or d[key] < 0):
@@ -821,6 +820,7 @@ def _apply_state(d):
     state.peak_capital   = d.get("peak_capital",   float(CAPITAL))
     state.dd_level       = d.get("dd_level",       0)
     state.dd_pause_until = d.get("dd_pause_until", 0)
+    state.dd_last_loss_bar_ts = d.get("dd_last_loss_bar_ts", 0)
     state.consec_losses  = d.get("consec_losses",  0)
     state.wins           = d.get("wins",           0)
     state.losses         = d.get("losses",         0)
@@ -832,6 +832,10 @@ def _apply_state(d):
     state.daily_losses   = d.get("daily_losses",   0)
     state.last_sl_long   = d.get("last_sl_long",   0.0)
     state.last_sl_short  = d.get("last_sl_short",  0.0)
+    if state.dd_last_loss_bar_ts <= 0:
+        latest_sl_ts = max(float(state.last_sl_long), float(state.last_sl_short))
+        if latest_sl_ts > 0:
+            state.dd_last_loss_bar_ts = (int(latest_sl_ts) // 300) * 300
     state.last_price     = d.get("last_price",      0.0)
     state.start_date     = date.fromisoformat(d["start_date"]) if d.get("start_date") else date.today()
 
@@ -934,19 +938,33 @@ def close_weekend():
 
 def get_dd_params():
     """
-    Retourne (risk_pct, score_malus, cooldown) selon niveau DD actuel.
+    Retourne (risk_pct, score_malus) selon niveau DD actuel.
 
     Niveau 1 (< 6%)   → Rien ne change — variance naturelle
-    Niveau 2 (6-10%)  → Score +0.5 | Cooldown 1200s | Risque inchangé
-    Niveau 3 (10-15%) → Risque 1.0% | Score +1.0 | Cooldown 1800s
+    Niveau 2 (6-10%)  → Score +0.5 | Risque inchangé
+    Niveau 3 (10-15%) → Risque 1.0% | Score +1.0
     Niveau 4 (> 15%)  → Arrêt complet (géré par check_drawdown)
     """
     if state.dd_level == 3:
-        return DD_RISK_ORANGE, DD_SCORE_MALUS_O, DD_COOLDOWN_O
+        return DD_RISK_ORANGE, DD_SCORE_MALUS_O
     elif state.dd_level == 2:
-        return DD_RISK_NORMAL, DD_SCORE_MALUS_Y, DD_COOLDOWN_Y
+        return DD_RISK_NORMAL, DD_SCORE_MALUS_Y
     else:  # Niveau 1 ou 0 — rien ne change
-        return DD_RISK_NORMAL, DD_SCORE_MALUS_N, DD_COOLDOWN_N
+        return DD_RISK_NORMAL, DD_SCORE_MALUS_N
+
+
+def _dd_waits_for_new_5m_setup(signal_bar_ts):
+    """
+    En DD N2/N3, interdit uniquement une ré-entrée sur la barre 5m du dernier SL.
+    Dès qu'un setup valide appartient à une barre 5m strictement postérieure,
+    la condition événementielle de reprise DD est satisfaite.
+    """
+    if state.dd_level not in (2, 3) or state.dd_last_loss_bar_ts <= 0:
+        return False
+    try:
+        return int(signal_bar_ts or 0) <= int(state.dd_last_loss_bar_ts)
+    except (TypeError, ValueError):
+        return True
 
 
 def check_drawdown():
@@ -1000,8 +1018,8 @@ def check_drawdown():
         dd_pct = round(dd * 100, 1)
         msgs = {
             1: None,  # Niveau 1 : silence — variance naturelle
-            2: f"⚠️ <b>DD Niveau 2 — {dd_pct}%</b>\nScore +{DD_SCORE_MALUS_Y} | Cooldown 20min\nBot continue — plus sélectif",
-            3: f"🟠 <b>DD Niveau 3 — {dd_pct}%</b>\nRisque → {DD_RISK_ORANGE*100:.0f}% | Score +{DD_SCORE_MALUS_O} | Cooldown 30min\nBot continue — très sélectif",
+            2: f"⚠️ <b>DD Niveau 2 — {dd_pct}%</b>\nScore +{DD_SCORE_MALUS_Y} | Reprise après SL sur nouveau setup 5m\nBot continue — plus sélectif",
+            3: f"🟠 <b>DD Niveau 3 — {dd_pct}%</b>\nRisque → {DD_RISK_ORANGE*100:.0f}% | Score +{DD_SCORE_MALUS_O} | Reprise après SL sur nouveau setup 5m\nBot continue — très sélectif",
             4: f"🛑 <b>DD STOP — {dd_pct}%</b>\nBot arrêté — reprise manuelle requise",
         }
         msg = msgs.get(state.dd_level)
@@ -1234,6 +1252,18 @@ def _check_position_exit(pos, current_price, last_1m_candle, *, phase2_use_extre
             state.consec_losses += 1
             if side == "long": state.last_sl_long = time.time()
             else: state.last_sl_short = time.time()
+
+            dd_after_loss = (
+                (state.peak_capital - state.capital) / state.peak_capital
+                if state.peak_capital > 0 else 0.0
+            )
+            if DD_ALERT_YELLOW <= dd_after_loss < DD_STOP_TOTAL:
+                event_ts = int((last_1m_candle or {}).get("timestamp", 0) or 0)
+                if event_ts <= 0 and state.last_processed_market_ts_ms > 0:
+                    event_ts = int(state.last_processed_market_ts_ms // 1000)
+                if event_ts > 0:
+                    state.dd_last_loss_bar_ts = (event_ts // 300) * 300
+
             _remove_position(pos)
             save_state()
             acct_pct = pnl / CAPITAL * 100
@@ -1735,7 +1765,7 @@ def main():
                 # Le marché est TOUJOURS analysé, même avec 1, 2 ou 3 positions ouvertes.
                 # DD/cooldown/slots ne bloquent que l'EXECUTION, jamais l'analyse.
                 trading_allowed = check_drawdown()
-                risk_pct, score_malus, _ = get_dd_params()
+                risk_pct, score_malus = get_dd_params()
 
                 signal = calc_signal(
                     candles_5m, candles_1m,
@@ -1752,6 +1782,11 @@ def main():
                         signal["reason"] = f"DD N{state.dd_level} score {signal['score']:.1f}<{min_score_eff:.1f}"
                     elif not trading_allowed:
                         signal["reason"] = f"Signal détecté mais entrée bloquée DD/pause N{state.dd_level}"
+                    elif _dd_waits_for_new_5m_setup(signal.get("_signal_bar_ts")):
+                        signal["reason"] = (
+                            f"DD N{state.dd_level}: attente nouveau setup 5m "
+                            f"après barre SL {state.dd_last_loss_bar_ts}"
+                        )
                     elif state.cooldown_remaining(side_sig) > 0:
                         cd = state.cooldown_remaining(side_sig)
                         signal["reason"] = f"Cooldown {side_sig.upper()}: {int(cd/60)}m{int(cd%60):02d}s"
