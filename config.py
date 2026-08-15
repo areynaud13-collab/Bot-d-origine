@@ -71,7 +71,7 @@ LOT_MIN        = 0.03       # Lot minimum viable — fermeture partielle 2/3+1/3
 # Fermeture partielle au TP1 puis TP2 — PAS DE RUNNER
 LOT_RATIO_TP1  = 2/3        # 2/3 du lot fermé au TP1
 LOT_RATIO_TP2  = 1/3        # 1/3 du lot fermé au TP2
-MAX_POSITIONS  = 1          # 1 seule position simultanée
+MAX_POSITIONS  = 3          # 1 seule position simultanée
 
 # ── Volume Profile ───────────────────────────────────────────────
 VP_LOOKBACK = 48            # 48 × 5m = 4h
