@@ -985,10 +985,10 @@ def calc_lot_size(risk_usd, sl_dist, price):
 # SIGNAL PRINCIPAL
 # ════════════════════════════════════════════════════════
 
-def calc_signal(candles_5m, candles_1m,
-                candles_1h=None, candles_4h=None, candles_dxy_4h=None,
-                liq_map=None, ob_map=None,
-                sweep_map=None, struct_map=None, dxy_map=None):
+def _calc_signal_candidates(candles_5m, candles_1m,
+                            candles_1h=None, candles_4h=None, candles_dxy_4h=None,
+                            liq_map=None, ob_map=None,
+                            sweep_map=None, struct_map=None, dxy_map=None):
     """
     Calcule le signal de trading V4.
 
@@ -1004,11 +1004,23 @@ def calc_signal(candles_5m, candles_1m,
         struct_map      : carte Structure 1h (pré-calculée)
         dxy_map         : carte Structure DXY 4h (pré-calculée)
 
-    Retourne dict avec signal, sl, tp1, tp2, lot_total, lot_tp1, lot_tp2, etc.
+    Retourne (candidats, no_signal) sans modifier les règles des setups.
     """
+    candidates = []
+    candidate_keys = set()
+
+    def add_candidate(sig):
+        if not sig:
+            return
+        key = (sig.get("setup"), sig.get("signal"))
+        if key in candidate_keys:
+            return
+        candidate_keys.add(key)
+        candidates.append(sig)
+
     # ── Validation données minimales ─────────────────────────────
     if not candles_5m or len(candles_5m) < VP_LOOKBACK + 60:
-        return {"signal": None, "reason": "Données 5m insuffisantes"}
+        return [], {"signal": None, "reason": "Données 5m insuffisantes"}
 
     # ── Extraction arrays 5m ─────────────────────────────────────
     highs   = [c["high"]   for c in candles_5m]
@@ -1028,9 +1040,9 @@ def calc_signal(candles_5m, candles_1m,
     ax      = adx_arr[i]
 
     if at is None or at < MIN_ATR:
-        return {"signal": None, "reason": f"ATR insuffisant ({at})"}
+        return [], {"signal": None, "reason": f"ATR insuffisant ({at})"}
     if ax is None:
-        return {"signal": None, "reason": "ADX non disponible"}
+        return [], {"signal": None, "reason": "ADX non disponible"}
 
     avg_at = calc_avg_atr(atr_arr, i, 50)
 
@@ -1049,7 +1061,7 @@ def calc_signal(candles_5m, candles_1m,
     vp = calc_volume_profile(highs, lows, closes, volumes,
                               VP_LOOKBACK, VP_BINS, VALUE_PCT)
     if vp is None:
-        return {"signal": None, "reason": "VP non calculable"}
+        return [], {"signal": None, "reason": "VP non calculable"}
 
     poc = vp["poc"]; vah = vp["vah"]; val = vp["val"]
     price = closes[i]
@@ -1224,7 +1236,7 @@ def calc_signal(candles_5m, candles_1m,
             if sc >= ms:
                 sig = build_signal("long", "VAL->POC", sl_p, tp1, tp2, sc,
                                    ["@VAL", f"ADX{ax:.0f}"])
-                if sig: return sig
+                if sig: add_candidate(sig)
 
         # L2 : POC → VAH
         if (abs(price - poc) < tol * 1.5 and price > poc and
@@ -1237,7 +1249,7 @@ def calc_signal(candles_5m, candles_1m,
             if sc >= ms:
                 sig = build_signal("long", "POC->VAH", sl_p, tp1, tp2, sc,
                                    ["@POC", f"ADX{ax:.0f}"])
-                if sig: return sig
+                if sig: add_candidate(sig)
 
         # L3 : VWAP -2SD → retournement extrême
         if sd2dn and vw:
@@ -1249,7 +1261,7 @@ def calc_signal(candles_5m, candles_1m,
             if sc >= max(ms, 4.0):
                 sig = build_signal("long", "VWAP-2SD", sl_p, tp1, tp2, sc,
                                    ["@2SD", "ΔExhaust"])
-                if sig: return sig
+                if sig: add_candidate(sig)
 
     # ════════════════════════════════════════════════════
     # SETUPS SHORT
@@ -1269,7 +1281,7 @@ def calc_signal(candles_5m, candles_1m,
             if sc >= ms:
                 sig = build_signal("short", "VAH->POC", sl_p, tp1, tp2, sc,
                                    ["@VAH", f"ADX{ax:.0f}"])
-                if sig: return sig
+                if sig: add_candidate(sig)
 
         # S2 : POC → VAL
         if (abs(price - poc) < tol * 1.5 and price < poc and
@@ -1282,7 +1294,7 @@ def calc_signal(candles_5m, candles_1m,
             if sc >= ms:
                 sig = build_signal("short", "POC->VAL", sl_p, tp1, tp2, sc,
                                    ["@POC", f"ADX{ax:.0f}"])
-                if sig: return sig
+                if sig: add_candidate(sig)
 
         # S3 : VWAP +2SD → retournement extrême
         if sd2up and vw:
@@ -1294,7 +1306,7 @@ def calc_signal(candles_5m, candles_1m,
             if sc >= max(ms, 4.0):
                 sig = build_signal("short", "VWAP+2SD", sl_p, tp1, tp2, sc,
                                    ["@2SD", "ΔExhaust"])
-                if sig: return sig
+                if sig: add_candidate(sig)
 
     # ════════════════════════════════════════════════════
     # SETUPS CONTINUATION DE TENDANCE (additifs)
@@ -1323,7 +1335,7 @@ def calc_signal(candles_5m, candles_1m,
             if sc >= ms_base:
                 sig = build_signal("long", "TF1-VWAP", sl_p, tp1, tp2, sc,
                                    ["@VWAP", "TREND_BULL", f"ADX{ax:.0f}"])
-                if sig: return sig
+                if sig: add_candidate(sig)
 
         # ── TF1 : Pullback VWAP central SHORT ────────────────
         # Régime TREND_BEAR + prix revient sur VWAP + delta épuisé haussier
@@ -1340,7 +1352,7 @@ def calc_signal(candles_5m, candles_1m,
             if sc >= ms_base:
                 sig = build_signal("short", "TF1-VWAP", sl_p, tp1, tp2, sc,
                                    ["@VWAP", "TREND_BEAR", f"ADX{ax:.0f}"])
-                if sig: return sig
+                if sig: add_candidate(sig)
 
     # ── TF2 : Retest POC en support LONG ─────────────────────
     # Structure 1h BULLISH + ADX > 25 + prix reteste POC par le dessus + delta positif
@@ -1355,7 +1367,7 @@ def calc_signal(candles_5m, candles_1m,
         if sc >= ms_base:
             sig = build_signal("long", "TF2-POC", sl_p, tp1, tp2, sc,
                                ["@POC-RETEST", "BULL", f"ADX{ax:.0f}"])
-            if sig: return sig
+            if sig: add_candidate(sig)
 
     # ── TF2 : Retest POC en résistance SHORT ─────────────────
     # Structure 1h BEARISH + ADX > 25 + prix reteste POC par le dessous + delta négatif
@@ -1370,14 +1382,49 @@ def calc_signal(candles_5m, candles_1m,
         if sc >= ms_base:
             sig = build_signal("short", "TF2-POC", sl_p, tp1, tp2, sc,
                                ["@POC-RETEST", "BEAR", f"ADX{ax:.0f}"])
-            if sig: return sig
+            if sig: add_candidate(sig)
+
+    if candidates:
+        return candidates, None
 
     # ── Pas de setup ─────────────────────────────────────────────
     vw_str  = f"VWAP:{vw['vwap']:.1f}" if vw else "VWAP:N/A"
     bias_str = f"Δ:{bias:.2f}" if bias is not None else "Δ:N/A"
-    return {
+    return [], {
         "signal": None,
         "reason": (f"No setup | POC:{poc} VAH:{vah} VAL:{val} | "
                    f"Struct:{struct} DXY:{dxy_struct} | "
                    f"{vw_str} | {bias_str} | ATR:{at:.2f} ADX:{ax:.1f}")
     }
+
+
+def calc_signals(candles_5m, candles_1m,
+                 candles_1h=None, candles_4h=None, candles_dxy_4h=None,
+                 liq_map=None, ob_map=None,
+                 sweep_map=None, struct_map=None, dxy_map=None):
+    """
+    Retourne tous les setups valides de l'évaluation courante, sans doublon
+    setup + direction et dans l'ordre de priorité historique de la V4.
+    """
+    candidates, _ = _calc_signal_candidates(
+        candles_5m, candles_1m,
+        candles_1h, candles_4h, candles_dxy_4h,
+        liq_map, ob_map, sweep_map, struct_map, dxy_map
+    )
+    return candidates
+
+
+def calc_signal(candles_5m, candles_1m,
+                candles_1h=None, candles_4h=None, candles_dxy_4h=None,
+                liq_map=None, ob_map=None,
+                sweep_map=None, struct_map=None, dxy_map=None):
+    """
+    Compatibilité V4 existante : retourne le premier candidat selon l'ordre
+    historique, ou le même dictionnaire no-signal qu'avant.
+    """
+    candidates, no_signal = _calc_signal_candidates(
+        candles_5m, candles_1m,
+        candles_1h, candles_4h, candles_dxy_4h,
+        liq_map, ob_map, sweep_map, struct_map, dxy_map
+    )
+    return candidates[0] if candidates else no_signal
