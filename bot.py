@@ -25,7 +25,7 @@ import requests as req
 from datetime import datetime, date, timezone
 from config import *
 from strategy import (
-    calc_signal,
+    calc_signal, calc_signals,
     build_liquidity_map_4h, build_order_blocks_4h,
     build_sweep_map_1h,     build_structure_1h,
     build_dxy_structure_4h,
@@ -1083,13 +1083,9 @@ def _portfolio_open_risk_usd():
 def _same_signal_already_open(signal):
     setup = signal.get("setup")
     side = signal.get("signal")
-    bar_ts = signal.get("_signal_bar_ts")
-    if bar_ts is None:
-        return False
     return any(
         pos.get("setup") == setup
         and pos.get("side") == side
-        and pos.get("signal_bar_ts") == bar_ts
         for pos in state.positions
     )
 
@@ -1117,7 +1113,7 @@ def open_position(signal, risk_pct, *, best_bid=None, best_ask=None):
     if len(state.positions) >= MAX_POSITIONS:
         return False, f"3/{MAX_POSITIONS} positions déjà ouvertes"
     if _same_signal_already_open(signal):
-        return False, "signal déjà ouvert sur cette bougie"
+        return False, "setup + direction déjà ouvert"
 
     side = signal["signal"]
     entry = float(signal["entry"])
@@ -1775,27 +1771,42 @@ def main():
                 )
 
                 if signal.get("signal"):
-                    signal["_signal_bar_ts"] = int(candles_5m[-1].get("timestamp", 0) or 0)
-                    side_sig = signal["signal"]
-                    min_score_eff = MIN_SCORE + score_malus
-                    if signal.get("score", 0) < min_score_eff:
-                        signal["reason"] = f"DD N{state.dd_level} score {signal['score']:.1f}<{min_score_eff:.1f}"
-                    elif not trading_allowed:
-                        signal["reason"] = f"Signal détecté mais entrée bloquée DD/pause N{state.dd_level}"
-                    elif _dd_waits_for_new_5m_setup(signal.get("_signal_bar_ts")):
-                        signal["reason"] = (
-                            f"DD N{state.dd_level}: attente nouveau setup 5m "
-                            f"après barre SL {state.dd_last_loss_bar_ts}"
-                        )
-                    elif state.cooldown_remaining(side_sig) > 0:
-                        cd = state.cooldown_remaining(side_sig)
-                        signal["reason"] = f"Cooldown {side_sig.upper()}: {int(cd/60)}m{int(cd%60):02d}s"
-                    else:
-                        opened, open_reason = open_position(
-                            signal, risk_pct, best_bid=best_bid, best_ask=best_ask
-                        )
-                        if not opened:
-                            signal["reason"] = f"{signal.get('reason','Signal')} | NON OUVERT: {open_reason}"
+                    signals = calc_signals(
+                        candles_5m, candles_1m,
+                        candles_1h, candles_4h, candles_dxy,
+                        state.liq_map, state.ob_map,
+                        state.sweep_map, state.struct_map, state.dxy_map
+                    )
+                    signal_bar_ts = int(candles_5m[-1].get("timestamp", 0) or 0)
+
+                    for idx, candidate in enumerate(signals):
+                        candidate["_signal_bar_ts"] = signal_bar_ts
+                        side_sig = candidate["signal"]
+                        min_score_eff = MIN_SCORE + score_malus
+                        if candidate.get("score", 0) < min_score_eff:
+                            candidate["reason"] = f"DD N{state.dd_level} score {candidate['score']:.1f}<{min_score_eff:.1f}"
+                        elif not trading_allowed:
+                            candidate["reason"] = f"Signal détecté mais entrée bloquée DD/pause N{state.dd_level}"
+                        elif _dd_waits_for_new_5m_setup(candidate.get("_signal_bar_ts")):
+                            candidate["reason"] = (
+                                f"DD N{state.dd_level}: attente nouveau setup 5m "
+                                f"après barre SL {state.dd_last_loss_bar_ts}"
+                            )
+                        elif state.cooldown_remaining(side_sig) > 0:
+                            cd = state.cooldown_remaining(side_sig)
+                            candidate["reason"] = f"Cooldown {side_sig.upper()}: {int(cd/60)}m{int(cd%60):02d}s"
+                        else:
+                            opened, open_reason = open_position(
+                                candidate, risk_pct, best_bid=best_bid, best_ask=best_ask
+                            )
+                            if not opened:
+                                candidate["reason"] = f"{candidate.get('reason','Signal')} | NON OUVERT: {open_reason}"
+
+                        if idx == 0:
+                            signal = candidate
+
+                        if len(state.positions) >= MAX_POSITIONS:
+                            break
 
                 if state.positions:
                     parts = []
