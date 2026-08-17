@@ -1109,8 +1109,15 @@ def _calc_signal_candidates(candles_5m, candles_1m,
     dxy_struct = dxy_ctx if isinstance(dxy_ctx, str) else "NEUTRAL"
 
     # ── Gate directionnelle — Structure 1h (remplace EMA) ────────
-    long_ok  = (struct == "BULLISH" or struct == "NEUTRAL" or sd2dn)
-    short_ok = (struct == "BEARISH" or struct == "NEUTRAL" or sd2up)
+    # PAPER exploration : la structure 1h reste calculée/journalisée et
+    # conserve son bonus de score, mais ne peut plus censurer une direction.
+    # LIVE : comportement historique strictement conservé.
+    if PAPER_MODE:
+        long_ok = True
+        short_ok = True
+    else:
+        long_ok  = (struct == "BULLISH" or struct == "NEUTRAL" or sd2dn)
+        short_ok = (struct == "BEARISH" or struct == "NEUTRAL" or sd2up)
 
     # ── Helper calcul score commun ────────────────────────────────
     def base_score_long(near_level):
