@@ -7,7 +7,7 @@
 #   ✅ MTF 4h : Liquidité Equal H/L + Order Blocks
 #   ✅ MTF 1h : Sweep detection + Structure HH/HL
 #   ✅ DXY 4h : Corrélation négative or/dollar (bonus/malus score)
-#   ✅ Jusqu’à 3 positions simultanées — risque portefeuille plafonné
+#   ✅ 1 seule position (pas 2) — fermeture partielle TP1/TP2
 #   ✅ Runner supprimé — TP2 fixe par RR Dynamique
 #   ✅ DD institutionnel 4 niveaux calibrés (20% max)
 #   ✅ Sizing dynamique capital $2000 · marge 30% max · lot max 0.08
@@ -25,7 +25,7 @@ import requests as req
 from datetime import datetime, date, timezone
 from config import *
 from strategy import (
-    calc_signal, calc_signals,
+    calc_signal,
     build_liquidity_map_4h, build_order_blocks_4h,
     build_sweep_map_1h,     build_structure_1h,
     build_dxy_structure_4h,
@@ -38,18 +38,10 @@ from entry_shadow import EntryShadowLab
 
 STATE_FILE = "/data/bot_state.json"
 STATE_BACKUP_FILE = "/data/bot_state.backup.json"
-STATE_VERSION = 4
+STATE_VERSION = 3
 PRE_WS_CUTOVER_STATE_FILE = "/data/bot_state.pre_ws12d.json"
 PRE_WS_CUTOVER_BACKUP_FILE = "/data/bot_state.backup.pre_ws12d.json"
 WS_STARTUP_VALIDATION_MARKER_FILE = f"/data/ws_startup_validation_{WS_STARTUP_VALIDATION_ID}.json"
-
-# ── Multi-position / coût économique ─────────────────────────────
-# MAX_POSITIONS reste piloté par config.py. Cette version exige 3.
-EXPECTED_MAX_POSITIONS = 3
-# Fallback standard Bitget taker si aucun override Railway n'est fourni.
-# Peut être remplacé par la valeur réelle du compte via variable d'environnement.
-TAKER_FEE_RATE = float(os.environ.get("BITGET_TAKER_FEE_RATE", "0.0006"))
-MIN_EXPECTED_NET_PROFIT_USD = float(os.environ.get("MIN_EXPECTED_NET_PROFIT_USD", "0.0"))
 
 
 # ── Logging ─────────────────────────────────────────────────────
@@ -134,7 +126,7 @@ def notify_n8n(pos, event_type, pnl_amount, phase, resultat):
 
 class State:
     def __init__(self):
-        self.positions       = []         # Jusqu'à 3 positions indépendantes
+        self.position        = None       # 1 seule position (dict ou None)
         self.last_price      = 0.0
         self.paper_balance   = float(CAPITAL)
         self.paper_pnl       = 0.0
@@ -152,7 +144,6 @@ class State:
         self.peak_capital    = float(CAPITAL)
         self.dd_level        = 0          # 0=normal 1=jaune 2=orange 3=rouge 4=stop
         self.dd_pause_until  = 0
-        self.dd_last_loss_bar_ts = 0      # Barre 5m du dernier SL en DD N2/N3
         self.consec_losses   = 0          # Compteur pertes consécutives
         # Cooldown directionnel
         self.last_sl_long    = 0.0
@@ -169,18 +160,6 @@ class State:
         self.last_processed_market_ts_ms = 0
         # Version réellement chargée depuis disque (non persistée séparément).
         self.loaded_state_version = STATE_VERSION
-
-    @property
-    def position(self):
-        """Compatibilité lecture dashboard : première position ouverte ou None."""
-        return self.positions[0] if self.positions else None
-
-    @property
-    def position_count(self):
-        return len(self.positions)
-
-    def get_position(self, trade_id):
-        return next((p for p in self.positions if p.get("trade_id") == trade_id), None)
 
     def reset_daily(self):
         if date.today() != self.start_date:
@@ -212,10 +191,20 @@ class State:
             return self.paper_balance
 
     def cooldown_remaining(self, side):
-        """Cooldown directionnel après SL uniquement — indépendant du niveau de DD."""
         base = COOLDOWN_AFTER_SL_LONG if side == "long" else COOLDOWN_AFTER_SL_SHORT
         elapsed = time.time() - (self.last_sl_long if side=="long" else self.last_sl_short)
-        return max(0, base - elapsed)
+
+        # PAPER EXPLORATION : conserver uniquement le cooldown normal après SL.
+        # Le drawdown reste mesuré mais n'allonge jamais ce cooldown en PAPER.
+        if PAPER_MODE:
+            return max(0, base - elapsed)
+
+        # Comportement LIVE historique inchangé.
+        cd = DD_COOLDOWN_N
+        if self.dd_level == 1: cd = DD_COOLDOWN_Y
+        elif self.dd_level == 2: cd = DD_COOLDOWN_O
+        elif self.dd_level >= 3: cd = DD_COOLDOWN_R
+        return max(0, max(base, cd) - elapsed)
 
 
 state  = State()
@@ -294,7 +283,7 @@ def bootstrap_ws_market_data(ws_client):
 def resync_ws_market_data(ws_client):
     """Resynchronisation REST 1m/5m après reconnexion/gap, avec recovery PAPER."""
     # Une position ouverte impose d'abord le replay sûr des minutes manquées.
-    if state.positions:
+    if state.position is not None:
         recover_open_position_closed_rest()
 
     candles_5m = exchange.get_candles(SYMBOL, INTERVAL_SIGNAL, CANDLES_5M + 10)
@@ -314,7 +303,7 @@ def resync_ws_market_data(ws_client):
     if not wait_for_fresh_ws_market(ws_client, baseline_stats=baseline_stats):
         raise RuntimeError(f"Resync WS refusé: aucune donnée fraîche post-seed {ws_client.health_snapshot()}")
 
-    if state.positions:
+    if state.position is not None:
         recover_open_position_ws_handoff(ws_client)
 
     ws_client.mark_resynchronised()
@@ -332,7 +321,7 @@ def run_ws_startup_validation(ws_client, candles_5m_hist, candles_1m_hist):
         log.info(f"12D STARTUP VALIDATION déjà validée: {WS_STARTUP_VALIDATION_MARKER_FILE}")
         return candles_5m_hist, candles_1m_hist
 
-    if state.positions:
+    if state.position is not None:
         raise RuntimeError("12D startup validation exige un état FLAT au premier cutover")
 
     start_snap = ws_client.health_snapshot()
@@ -502,25 +491,19 @@ def _fetch_recovery_1m():
     return candles
 
 
-def _positions_desc():
-    if not state.positions:
-        return "FLAT"
-    return ",".join(str(p.get("trade_id", "?")) for p in state.positions)
-
-
 def recover_open_position_closed_rest(now_ms=None):
     """
-    Rejoue les minutes REST clôturées pour TOUTES les positions PAPER ouvertes.
-    Toute ambiguïté intrabar sur une seule position déclenche le fail-safe global.
+    Rejoue uniquement les minutes REST déjà clôturées depuis le curseur persistant.
+    Retourne True si le recovery est sûr. Toute ambiguïté déclenche un fail-safe.
     """
-    if not state.positions:
+    if state.position is None:
         return True
     if state.loaded_state_version != STATE_VERSION:
         raise MarketRecoveryError(
-            f"positions ouvertes issues du schéma v{state.loaded_state_version}: recovery v{STATE_VERSION} impossible"
+            f"position ouverte issue du schéma v{state.loaded_state_version}: recovery v3 impossible"
         )
     if state.last_processed_market_ts_ms <= 0:
-        raise MarketRecoveryError("positions ouvertes sans last_processed_market_ts_ms valide")
+        raise MarketRecoveryError("position ouverte sans last_processed_market_ts_ms valide")
 
     now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
     candles = _fetch_recovery_1m()
@@ -538,41 +521,45 @@ def recover_open_position_closed_rest(now_ms=None):
         if end_ms <= cursor:
             continue
         if end_ms > now_ms:
-            break
+            break  # minute en formation : traitée au handoff WS, pas ici
 
-        actions = []
-        for pos in list(state.positions):
-            action = _classify_recovery_candle(pos, candle)
-            if action.startswith("AMBIGUOUS_"):
-                raise MarketRecoveryError(
-                    f"recovery intrabar ambigu {action} @ {start_ms} pour {pos['trade_id']}"
-                )
-            actions.append(action)
+        action = _classify_recovery_candle(state.position, candle)
+        if action.startswith("AMBIGUOUS_"):
+            raise MarketRecoveryError(
+                f"recovery intrabar ambigu {action} @ {start_ms} pour {state.position['trade_id']}"
+            )
 
+        # Le curseur est avancé AVANT toute transition : si check_exits persiste
+        # une clôture, le snapshot position+curseur reste atomiquement cohérent.
         state.last_processed_market_ts_ms = end_ms
         state.last_price = float(candle.get("close", state.last_price))
 
-        if any(action in {"SL", "SL2", "TP2"} for action in actions):
+        if action in {"SL", "SL2", "TP2"}:
             check_exits(state.last_price, candle, phase2_use_extremes=True)
 
         processed += 1
         cursor = end_ms
-        if not state.positions:
+        if state.position is None:
             break
 
     if processed:
         if not save_state():
             raise MarketRecoveryError("recovery calculé mais persistance impossible")
         log.warning(
-            "Recovery REST 1m appliqué | minutes=%s | cursor=%s | positions=%s",
-            processed, state.last_processed_market_ts_ms, _positions_desc(),
+            "Recovery REST 1m appliqué | minutes=%s | cursor=%s | position=%s",
+            processed,
+            state.last_processed_market_ts_ms,
+            state.position["trade_id"] if state.position else "FLAT",
         )
     return True
 
 
 def recover_open_position_ws_handoff(ws_client):
-    """Ferme le trou REST -> WS pour toutes les positions ouvertes."""
-    if not state.positions:
+    """
+    Ferme la fenêtre entre la dernière minute REST clôturée et le premier ticker WS.
+    Aucun tick normal n'est accepté tant que ce handoff n'est pas validé.
+    """
+    if state.position is None:
         return True
 
     snap = ws_client.health_snapshot()
@@ -592,28 +579,26 @@ def recover_open_position_ws_handoff(ws_client):
     if market_ts_ms <= state.last_processed_market_ts_ms:
         return True
 
-    actions = []
-    for pos in list(state.positions):
-        action = _classify_recovery_candle(pos, current_1m)
-        if action.startswith("AMBIGUOUS_"):
-            raise MarketRecoveryError(
-                f"handoff intrabar ambigu {action} @ {start_ms} pour {pos['trade_id']}"
-            )
-        actions.append(action)
+    action = _classify_recovery_candle(state.position, current_1m)
+    if action.startswith("AMBIGUOUS_"):
+        raise MarketRecoveryError(
+            f"handoff intrabar ambigu {action} @ {start_ms} pour {state.position['trade_id']}"
+        )
 
     state.last_processed_market_ts_ms = market_ts_ms
     live_price = ws_client.get_live_price()
     if live_price is not None:
         state.last_price = float(live_price)
 
-    if any(action in {"SL", "SL2", "TP2"} for action in actions):
+    if action in {"SL", "SL2", "TP2"}:
         check_exits(state.last_price, current_1m, phase2_use_extremes=True)
 
     if not save_state():
         raise MarketRecoveryError("handoff WS validé mais persistance impossible")
     log.warning(
-        "Recovery handoff WS validé | cursor=%s | positions=%s",
-        state.last_processed_market_ts_ms, _positions_desc(),
+        "Recovery handoff WS validé | cursor=%s | position=%s",
+        state.last_processed_market_ts_ms,
+        state.position["trade_id"] if state.position else "FLAT",
     )
     return True
 
@@ -655,10 +640,10 @@ def _json_safe(value):
 
 
 def _state_payload():
-    positions = _json_safe(state.positions)
+    position = _json_safe(state.position) if state.position is not None else None
     return {
         "state_version":   STATE_VERSION,
-        "positions":       positions,
+        "position":        position,
         "last_price":      state.last_price,
         "last_processed_market_ts_ms": state.last_processed_market_ts_ms,
         "paper_balance":   state.paper_balance,
@@ -666,7 +651,6 @@ def _state_payload():
         "peak_capital":    state.peak_capital,
         "dd_level":        state.dd_level,
         "dd_pause_until":  state.dd_pause_until,
-        "dd_last_loss_bar_ts": state.dd_last_loss_bar_ts,
         "consec_losses":   state.consec_losses,
         "wins":            state.wins,
         "losses":          state.losses,
@@ -727,7 +711,7 @@ def _validate_state_dict(d):
     int_fields = (
         "dd_level", "consec_losses", "wins", "losses", "total_trades",
         "trade_counter", "daily_trades", "daily_wins", "daily_losses",
-        "last_processed_market_ts_ms", "dd_last_loss_bar_ts",
+        "last_processed_market_ts_ms",
     )
     for key in int_fields:
         if key in d and (isinstance(d[key], bool) or not isinstance(d[key], int) or d[key] < 0):
@@ -743,37 +727,22 @@ def _validate_state_dict(d):
     if d.get("start_date") is not None:
         date.fromisoformat(d["start_date"])
 
-    version = d.get("state_version", 1)
-    if version >= 4:
-        positions = d.get("positions")
-        if not isinstance(positions, list):
-            raise ValueError("positions v4 absentes/invalides")
-    else:
-        legacy_position = d.get("position")
-        positions = [] if legacy_position is None else [legacy_position]
-
-    if len(positions) > EXPECTED_MAX_POSITIONS:
-        raise ValueError(f"trop de positions persistées: {len(positions)}")
-
-    required = (
-        "trade_id", "side", "entry", "sl", "tp1", "tp2",
-        "lot_total", "lot_tp1", "lot_tp2", "tp1_hit",
-        "sl_lot2", "entry_time",
-    )
-    seen_ids = set()
-    for position in positions:
+    position = d.get("position")
+    if position is not None:
         if not isinstance(position, dict):
             raise ValueError("position invalide")
+        required = (
+            "trade_id", "side", "entry", "sl", "tp1", "tp2",
+            "lot_total", "lot_tp1", "lot_tp2", "tp1_hit",
+            "sl_lot2", "entry_time",
+        )
         missing = [key for key in required if key not in position]
         if missing:
             raise ValueError(f"position incomplète: {','.join(missing)}")
         if position["side"] not in ("long", "short"):
             raise ValueError("side position invalide")
-        if not isinstance(position["trade_id"], str) or not position["trade_id"]:
+        if not isinstance(position["trade_id"], str):
             raise ValueError("trade_id invalide")
-        if position["trade_id"] in seen_ids:
-            raise ValueError("trade_id dupliqué")
-        seen_ids.add(position["trade_id"])
         entry_time = datetime.fromisoformat(position["entry_time"])
         if entry_time.tzinfo is None:
             raise ValueError("entry_time sans timezone")
@@ -786,10 +755,11 @@ def _validate_state_dict(d):
         if not isinstance(position["tp1_hit"], bool):
             raise ValueError("tp1_hit invalide")
 
+    version = d.get("state_version", 1)
     if version >= 3 and "last_processed_market_ts_ms" not in d:
-        raise ValueError("curseur marché v3+ absent")
-    if positions and version >= 3 and d.get("last_processed_market_ts_ms", 0) <= 0:
-        raise ValueError("positions ouvertes sans curseur marché")
+        raise ValueError("curseur marché v3 absent")
+    if position is not None and version >= 3 and d.get("last_processed_market_ts_ms", 0) <= 0:
+        raise ValueError("position v3 ouverte sans curseur marché")
 
     return d
 
@@ -820,7 +790,6 @@ def _apply_state(d):
     state.peak_capital   = d.get("peak_capital",   float(CAPITAL))
     state.dd_level       = d.get("dd_level",       0)
     state.dd_pause_until = d.get("dd_pause_until", 0)
-    state.dd_last_loss_bar_ts = d.get("dd_last_loss_bar_ts", 0)
     state.consec_losses  = d.get("consec_losses",  0)
     state.wins           = d.get("wins",           0)
     state.losses         = d.get("losses",         0)
@@ -832,26 +801,14 @@ def _apply_state(d):
     state.daily_losses   = d.get("daily_losses",   0)
     state.last_sl_long   = d.get("last_sl_long",   0.0)
     state.last_sl_short  = d.get("last_sl_short",  0.0)
-    if state.dd_last_loss_bar_ts <= 0:
-        latest_sl_ts = max(float(state.last_sl_long), float(state.last_sl_short))
-        if latest_sl_ts > 0:
-            state.dd_last_loss_bar_ts = (int(latest_sl_ts) // 300) * 300
     state.last_price     = d.get("last_price",      0.0)
     state.start_date     = date.fromisoformat(d["start_date"]) if d.get("start_date") else date.today()
 
-    loaded_version = d.get("state_version", 1)
-    if loaded_version >= 4:
-        raw_positions = d.get("positions", [])
-    else:
-        legacy_position = d.get("position")
-        raw_positions = [] if legacy_position is None else [legacy_position]
-
-    positions = []
-    for raw in raw_positions:
-        pos = dict(raw)
-        pos["entry_time"] = datetime.fromisoformat(pos["entry_time"])
-        positions.append(pos)
-    state.positions = positions
+    position = d.get("position")
+    if position is not None:
+        position = dict(position)
+        position["entry_time"] = datetime.fromisoformat(position["entry_time"])
+    state.position = position
 
     # Les cartes MTF ne sont pas persistées : forcer leur recalcul au premier cycle.
     state.liq_map = {}
@@ -870,9 +827,7 @@ def load_state():
             d = _read_valid_state(path)
             _apply_state(d)
             loaded_version = d.get("state_version", 1)
-            # v3 -> v4 est une migration sémantiquement sûre : position unique -> liste.
-            # Les versions antérieures à v3 gardent le fail-safe si une position est ouverte.
-            if loaded_version < 3 and state.positions:
+            if loaded_version != STATE_VERSION and state.position is not None:
                 raise ValueError(
                     f"migration v{loaded_version}->v{STATE_VERSION} refusée avec position ouverte"
                 )
@@ -888,7 +843,7 @@ def load_state():
             log.info(
                 f"État chargé ({label}) | Capital: ${state.paper_balance:.2f} | "
                 f"Trades: {state.total_trades} | WR: {state.wr:.0f}% | "
-                f"Positions: {_positions_desc()} ({len(state.positions)}/{MAX_POSITIONS})"
+                f"Position: {state.position['trade_id'] if state.position else 'FLAT'}"
             )
             return True
         except FileNotFoundError:
@@ -911,25 +866,24 @@ def is_weekend_close_time():
 
 
 def close_weekend():
-    if not state.positions:
+    if state.position is None:
         return
-    log.warning("⏰ FERMETURE WEEKEND — Clôture de toutes les positions ouvertes")
+    log.warning("⏰ FERMETURE WEEKEND — Clôture position ouverte")
+    pos = state.position
     current_price = state.last_price
-    for pos in list(state.positions):
-        contracts = pos["lot_tp2"] if pos.get("tp1_hit") else pos["lot_total"]
-        pnl = _calc_pnl(pos["side"], pos["entry"], current_price, contracts)
-        state.paper_balance += pnl
-        if pnl > 0: state.wins += 1
-        else:        state.losses += 1
-        state.total_trades += 1
-        state.paper_pnl    += pnl
-        state.daily_pnl    += pnl
-        state.positions.remove(pos)
-        tg(f"⏰ <b>Weekend Close</b> — {pos['trade_id']}\n"
-           f"${pos['entry']:.2f}→${current_price:.2f} | {pnl:+.2f}$\n"
-           f"Capital: ${state.paper_balance:.2f}")
-        notify_n8n(pos, "WEEKEND_CLOSE", pnl, "WEEKEND", "WEEKEND")
+    pnl = _calc_pnl(pos["side"], pos["entry"], current_price, pos["lot_total"])
+    state.paper_balance += pnl
+    if pnl > 0: state.wins += 1
+    else:        state.losses += 1
+    state.total_trades += 1
+    state.paper_pnl    += pnl
+    state.daily_pnl    += pnl
+    state.position      = None
     save_state()
+    tg(f"⏰ <b>Weekend Close</b>\n"
+       f"${pos['entry']:.2f}→${current_price:.2f} | {pnl:+.2f}$\n"
+       f"Capital: ${state.paper_balance:.2f}")
+    notify_n8n(pos, "WEEKEND_CLOSE", pnl, "WEEKEND", "WEEKEND")
 
 
 # ════════════════════════════════════════════════════════
@@ -938,33 +892,24 @@ def close_weekend():
 
 def get_dd_params():
     """
-    Retourne (risk_pct, score_malus) selon niveau DD actuel.
+    Retourne (risk_pct, score_malus, cooldown) selon niveau DD actuel.
 
-    Niveau 1 (< 6%)   → Rien ne change — variance naturelle
-    Niveau 2 (6-10%)  → Score +0.5 | Risque inchangé
-    Niveau 3 (10-15%) → Risque 1.0% | Score +1.0
-    Niveau 4 (> 15%)  → Arrêt complet (géré par check_drawdown)
+    PAPER EXPLORATION :
+      - risque normal conservé (2% via DD_RISK_NORMAL)
+      - aucun malus de score lié au DD
+      - aucun cooldown ajouté par le DD
+
+    LIVE : comportement historique conservé.
     """
+    if PAPER_MODE:
+        return DD_RISK_NORMAL, 0.0, 0
+
     if state.dd_level == 3:
-        return DD_RISK_ORANGE, DD_SCORE_MALUS_O
+        return DD_RISK_ORANGE, DD_SCORE_MALUS_O, DD_COOLDOWN_O
     elif state.dd_level == 2:
-        return DD_RISK_NORMAL, DD_SCORE_MALUS_Y
+        return DD_RISK_NORMAL, DD_SCORE_MALUS_Y, DD_COOLDOWN_Y
     else:  # Niveau 1 ou 0 — rien ne change
-        return DD_RISK_NORMAL, DD_SCORE_MALUS_N
-
-
-def _dd_waits_for_new_5m_setup(signal_bar_ts):
-    """
-    En DD N2/N3, interdit uniquement une ré-entrée sur la barre 5m du dernier SL.
-    Dès qu'un setup valide appartient à une barre 5m strictement postérieure,
-    la condition événementielle de reprise DD est satisfaite.
-    """
-    if state.dd_level not in (2, 3) or state.dd_last_loss_bar_ts <= 0:
-        return False
-    try:
-        return int(signal_bar_ts or 0) <= int(state.dd_last_loss_bar_ts)
-    except (TypeError, ValueError):
-        return True
+        return DD_RISK_NORMAL, DD_SCORE_MALUS_N, DD_COOLDOWN_N
 
 
 def check_drawdown():
@@ -982,6 +927,30 @@ def check_drawdown():
             tg(f"✅ <b>Nouveau pic: ${cap:.2f}</b> | DD remis à zéro")
 
     dd = (state.peak_capital - cap) / state.peak_capital if state.peak_capital > 0 else 0
+
+    # PAPER EXPLORATION : le DD reste calculé, affiché et persisté comme métrique,
+    # mais il ne modifie ni le risque, ni le score, ni le cooldown et ne bloque
+    # jamais les nouvelles entrées. Les pauses sur séries de pertes sont également
+    # neutralisées. Le cooldown normal après SL reste géré par cooldown_remaining().
+    if PAPER_MODE:
+        old_level = state.dd_level
+        if   dd >= DD_STOP_TOTAL:    state.dd_level = 4
+        elif dd >= DD_ALERT_ORANGE:  state.dd_level = 3
+        elif dd >= DD_ALERT_YELLOW:  state.dd_level = 2
+        else:                        state.dd_level = 1
+
+        # Nettoie une éventuelle pause héritée d'un état PAPER antérieur sans
+        # toucher au compteur de pertes, afin de préserver les données d'audit.
+        if state.dd_pause_until != 0:
+            state.dd_pause_until = 0
+            save_state()
+
+        if state.dd_level != old_level:
+            log.info(
+                f"PAPER exploration | DD N{state.dd_level} {dd*100:.1f}% "
+                "informatif — aucune restriction DD"
+            )
+        return True
 
     # Stop total > 20%
     if dd >= DD_STOP_TOTAL:
@@ -1018,8 +987,8 @@ def check_drawdown():
         dd_pct = round(dd * 100, 1)
         msgs = {
             1: None,  # Niveau 1 : silence — variance naturelle
-            2: f"⚠️ <b>DD Niveau 2 — {dd_pct}%</b>\nScore +{DD_SCORE_MALUS_Y} | Reprise après SL sur nouveau setup 5m\nBot continue — plus sélectif",
-            3: f"🟠 <b>DD Niveau 3 — {dd_pct}%</b>\nRisque → {DD_RISK_ORANGE*100:.0f}% | Score +{DD_SCORE_MALUS_O} | Reprise après SL sur nouveau setup 5m\nBot continue — très sélectif",
+            2: f"⚠️ <b>DD Niveau 2 — {dd_pct}%</b>\nScore +{DD_SCORE_MALUS_Y} | Cooldown 20min\nBot continue — plus sélectif",
+            3: f"🟠 <b>DD Niveau 3 — {dd_pct}%</b>\nRisque → {DD_RISK_ORANGE*100:.0f}% | Score +{DD_SCORE_MALUS_O} | Cooldown 30min\nBot continue — très sélectif",
             4: f"🛑 <b>DD STOP — {dd_pct}%</b>\nBot arrêté — reprise manuelle requise",
         }
         msg = msgs.get(state.dd_level)
@@ -1060,303 +1029,225 @@ def _calc_pnl(side, entry, exit_p, contracts):
 # OUVERTURE DE POSITION
 # ════════════════════════════════════════════════════════
 
-def _position_open_risk_usd(pos):
-    """Perte supplémentaire maximale jusqu'au stop actuel, plancher zéro."""
-    if not pos:
-        return 0.0
-    side = pos["side"]
-    entry = float(pos["entry"])
-    if pos.get("tp1_hit", False):
-        stop = float(pos["sl_lot2"])
-        qty = int(pos["lot_tp2"])
-    else:
-        stop = float(pos["sl"])
-        qty = int(pos["lot_total"])
-    adverse_move = max(0.0, entry - stop) if side == "long" else max(0.0, stop - entry)
-    return adverse_move * qty * state.contract_size
-
-
-def _portfolio_open_risk_usd():
-    return sum(_position_open_risk_usd(pos) for pos in state.positions)
-
-
-def _same_signal_already_open(signal):
-    setup = signal.get("setup")
-    side = signal.get("signal")
-    return any(
-        pos.get("setup") == setup
-        and pos.get("side") == side
-        for pos in state.positions
-    )
-
-
-def _estimated_roundtrip_cost_usd(entry, tp1, lot_total, best_bid=None, best_ask=None):
-    """Frais taker aller/retour + spread observé, sans inventer de funding futur."""
-    qty_oz = lot_total * state.contract_size
-    fee_open = abs(entry * qty_oz) * TAKER_FEE_RATE
-    fee_close = abs(tp1 * qty_oz) * TAKER_FEE_RATE
-    spread = 0.0
-    if best_bid is not None and best_ask is not None:
-        try:
-            spread = max(0.0, float(best_ask) - float(best_bid)) * qty_oz
-        except (TypeError, ValueError):
-            spread = 0.0
-    return fee_open + fee_close + spread
-
-
-def open_position(signal, risk_pct, *, best_bid=None, best_ask=None):
+def open_position(signal, risk_pct):
     """
-    Ouvre une position si un des 3 slots est libre et si le risque portefeuille
-    reste sous le plafond DD (2% normal, plus bas si DD le demande).
-    RR, SL, TP1 et TP2 restent ceux fournis par la stratégie.
+    Ouvre 1 seule position avec sizing dynamique.
+    Fermeture partielle : 2/3 au TP1, 1/3 au TP2.
     """
-    if len(state.positions) >= MAX_POSITIONS:
-        return False, f"3/{MAX_POSITIONS} positions déjà ouvertes"
-    if _same_signal_already_open(signal):
-        return False, "setup + direction déjà ouvert"
+    if state.position is not None:
+        return
 
-    side = signal["signal"]
-    entry = float(signal["entry"])
-    sl = float(signal["sl"])
-    tp1 = float(signal["tp1"])
-    tp2 = float(signal["tp2"])
+    side   = signal["signal"]
+    entry  = signal["entry"]
+    sl     = signal["sl"]
+    tp1    = signal["tp1"]
+    tp2    = signal["tp2"]
     sl_dist = abs(entry - sl)
-    if sl_dist <= 0:
-        return False, "SL invalide"
 
-    portfolio_risk_pct = min(float(risk_pct), float(RISK_PER_TRADE))
-    portfolio_budget = state.capital * portfolio_risk_pct
-    open_risk_before = _portfolio_open_risk_usd()
-    remaining_budget = max(0.0, portfolio_budget - open_risk_before)
-    trade_risk_budget = remaining_budget
-    if trade_risk_budget <= 0:
-        return False, f"budget risque portefeuille épuisé ({open_risk_before:.2f}/{portfolio_budget:.2f}$)"
-
-    contracts_risk = trade_risk_budget / (sl_dist * state.contract_size)
+    # Sizing Bitget en contrats — risque + plafond de marge
+    risk_usd = CAPITAL * risk_pct
+    contracts_risk = risk_usd / (sl_dist * state.contract_size)
     contracts_margin = (CAPITAL * MARGIN_CAP * LEVERAGE) / (entry * state.contract_size)
     lot_total = int(min(contracts_risk, contracts_margin))
     lot_total -= lot_total % 3
     if lot_total < 3:
-        return False, "taille < minimum 3 contrats"
-
-    actual_risk = sl_dist * lot_total * state.contract_size
-    if open_risk_before + actual_risk > portfolio_budget + 1e-9:
-        return False, "plafond risque portefeuille dépassé"
-
-    # Filtre économique : un trade qui atteint TP1 puis ressort au stop TP1 sur le
-    # reliquat doit rester positif après frais taker + spread observé.
-    gross_min_after_tp1 = abs(tp1 - entry) * lot_total * state.contract_size
-    est_cost = _estimated_roundtrip_cost_usd(entry, tp1, lot_total, best_bid, best_ask)
-    expected_net = gross_min_after_tp1 - est_cost
-    if expected_net <= MIN_EXPECTED_NET_PROFIT_USD:
-        return False, (
-            f"profit net insuffisant {expected_net:.2f}$ "
-            f"(brut {gross_min_after_tp1:.2f}$ - coûts {est_cost:.2f}$)"
-        )
-
+        return
     lot_tp1 = lot_total * 2 // 3
     lot_tp2 = lot_total - lot_tp1
 
     state.trade_counter += 1
     trade_id = f"V4-{state.trade_counter:04d}"
-    pos = {
-        "trade_id": trade_id,
-        "side": side,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "lot_total": lot_total,
-        "lot_tp1": lot_tp1,
-        "lot_tp2": lot_tp2,
-        "tp1_hit": False,
-        "sl_lot2": sl,
-        "setup": signal.get("setup", "V4"),
-        "score": signal.get("score", 0),
-        "atr": signal.get("atr", 0),
-        "adx": signal.get("adx", 0),
-        "rrd": signal.get("rrd", 0),
-        "struct_1h": signal.get("struct_1h", "N/A"),
-        "dxy_4h": signal.get("dxy_4h", "N/A"),
-        "sweep": signal.get("sweep", "none"),
-        "vwap": signal.get("vwap", 0),
-        "delta": signal.get("delta", 0),
-        "multi_vp_score": signal.get("multi_vp_score", None),
-        "multi_vp_bias": signal.get("multi_vp_bias", "N/A"),
-        "vp_daily_score": signal.get("vp_daily_score", None),
-        "vp_4h_score": signal.get("vp_4h_score", None),
-        "vp_session_score": signal.get("vp_session_score", None),
-        "vp_daily_maturity": signal.get("vp_daily_maturity", None),
-        "vp_session_maturity": signal.get("vp_session_maturity", None),
-        "entry_time": datetime.now(timezone.utc),
-        "capital_at_entry": state.paper_balance,
-        "signal_bar_ts": signal.get("_signal_bar_ts"),
-        "risk_budget_usd": round(trade_risk_budget, 6),
-        "risk_at_entry_usd": round(actual_risk, 6),
-        "portfolio_risk_before_usd": round(open_risk_before, 6),
-        "expected_net_tp1_usd": round(expected_net, 6),
-        "estimated_cost_usd": round(est_cost, 6),
-    }
-    state.positions.append(pos)
-    if not save_state():
-        state.positions = [p for p in state.positions if p.get("trade_id") != trade_id]
-        return False, "persistance impossible — position annulée"
 
+    pos = {
+        "trade_id":     trade_id,
+        "side":         side,
+        "entry":        entry,
+        "sl":           sl,
+        "tp1":          tp1,
+        "tp2":          tp2,
+        "lot_total":    lot_total,
+        "lot_tp1":      lot_tp1,
+        "lot_tp2":      lot_tp2,
+        "tp1_hit":      False,    # TP1 atteint → 2/3 fermés
+        "sl_lot2":      sl,       # SL du 1/3 restant (remonté au TP1)
+        "setup":        signal.get("setup", "V4"),
+        "score":        signal.get("score", 0),
+        "atr":          signal.get("atr", 0),
+        "adx":          signal.get("adx", 0),
+        "rrd":          signal.get("rrd", 0),
+        "struct_1h":    signal.get("struct_1h", "N/A"),
+        "dxy_4h":       signal.get("dxy_4h", "N/A"),
+        "sweep":        signal.get("sweep", "none"),
+        "vwap":         signal.get("vwap", 0),
+        "delta":        signal.get("delta", 0),
+        "multi_vp_score":       signal.get("multi_vp_score", None),
+        "multi_vp_bias":        signal.get("multi_vp_bias", "N/A"),
+        "vp_daily_score":       signal.get("vp_daily_score", None),
+        "vp_4h_score":          signal.get("vp_4h_score", None),
+        "vp_session_score":     signal.get("vp_session_score", None),
+        "vp_daily_maturity":    signal.get("vp_daily_maturity", None),
+        "vp_session_maturity":  signal.get("vp_session_maturity", None),
+        "entry_time":   datetime.now(timezone.utc),
+        "capital_at_entry": state.paper_balance,
+    }
+    state.position = pos
+    save_state()
+
+    rr_cible = round(abs(tp1 - entry) / sl_dist, 2) if sl_dist > 0 else 0
     log.info(
         f"🟢 OPEN {side.upper()} [{signal['setup']}] ${entry:.2f} | "
         f"SL:${sl:.2f} TP1:${tp1:.2f} TP2:${tp2:.2f} | "
-        f"Lot:{lot_total} | Risk:{actual_risk:.2f}$ "
-        f"Portfolio:{_portfolio_open_risk_usd():.2f}/{portfolio_budget:.2f}$ | "
-        f"NetTP1~{expected_net:.2f}$ | Slots:{len(state.positions)}/{MAX_POSITIONS} | "
+        f"Lot:{lot_total} (TP1:{lot_tp1}/TP2:{lot_tp2}) | "
         f"Score:{signal.get('score',0):.1f} | RRd:{signal.get('rrd',0)}"
     )
     tg(
-        f"🟢 <b>OPEN {side.upper()} — {signal['setup']}</b> [{len(state.positions)}/{MAX_POSITIONS}]\n"
+        f"🟢 <b>OPEN {side.upper()} — {signal['setup']}</b>\n"
         f"${entry:.2f} | SL:${sl:.2f} | TP1:${tp1:.2f} | TP2:${tp2:.2f}\n"
-        f"Risque:{actual_risk:.2f}$ | Risque portefeuille:{_portfolio_open_risk_usd():.2f}/{portfolio_budget:.2f}$\n"
-        f"Net TP1 estimé:{expected_net:.2f}$ | RRd:{signal.get('rrd',0)} | Score:{signal.get('score',0):.1f}"
+        f"Lot:{lot_total} | RRd:{signal.get('rrd',0)} | Score:{signal.get('score',0):.1f}\n"
+        f"Struct:{signal.get('struct_1h','?')} | DXY:{signal.get('dxy_4h','?')}"
     )
     notify_n8n(pos, "OPEN", 0, "OPEN", "OPEN")
-    return True, f"OPEN {trade_id}"
 
 
-def _remove_position(pos):
-    trade_id = pos.get("trade_id")
-    state.positions = [p for p in state.positions if p.get("trade_id") != trade_id]
+# ════════════════════════════════════════════════════════
+# GESTION DES SORTIES
+# ════════════════════════════════════════════════════════
 
+def check_exits(current_price, last_1m_candle, *, phase2_use_extremes=False):
+    """
+    Gestion complète des sorties pour 1 position avec fermeture partielle.
 
-def _check_position_exit(pos, current_price, last_1m_candle, *, phase2_use_extremes=False):
+    Phase 1 : lot_total ouvert → SL ou TP1
+    Phase 2 : TP1 atteint → lot_tp1 fermé, lot_tp2 continue vers TP2
+              SL du lot_tp2 remonté au niveau TP1 (breakeven garanti)
+    """
+    if state.position is None:
+        return
+
+    pos  = state.position
     side = pos["side"]
-    ep = pos["entry"]
-    h = last_1m_candle.get("high", current_price) if last_1m_candle else current_price
-    l = last_1m_candle.get("low", current_price) if last_1m_candle else current_price
+    ep   = pos["entry"]
+    h    = last_1m_candle.get("high",  current_price) if last_1m_candle else current_price
+    l    = last_1m_candle.get("low",   current_price) if last_1m_candle else current_price
+    acct = state.paper_balance
 
+    # ── Phase 1 — TP1 non encore atteint ─────────────────────────
     if not pos["tp1_hit"]:
-        sl_hit = (side == "long" and l <= pos["sl"]) or (side == "short" and h >= pos["sl"])
-        tp1_hit = (side == "long" and h >= pos["tp1"]) or (side == "short" and l <= pos["tp1"])
+        # SL total touché
+        sl_hit = (side == "long"  and l  <= pos["sl"]) or \
+                 (side == "short" and h  >= pos["sl"])
+        tp1_hit = (side == "long"  and h  >= pos["tp1"]) or \
+                  (side == "short" and l  <= pos["tp1"])
 
         if sl_hit:
             exit_p = pos["sl"]
-            pnl = _calc_pnl(side, ep, exit_p, pos["lot_total"])
+            pnl    = _calc_pnl(side, ep, exit_p, pos["lot_total"])
             state.paper_balance += pnl
-            state.paper_pnl += pnl
-            state.daily_pnl += pnl
-            state.losses += 1
-            state.daily_losses += 1
-            state.total_trades += 1
-            state.daily_trades += 1
+            state.paper_pnl     += pnl
+            state.daily_pnl     += pnl
+            state.losses        += 1
+            state.daily_losses  += 1
+            state.total_trades  += 1
+            state.daily_trades  += 1
             state.consec_losses += 1
-            if side == "long": state.last_sl_long = time.time()
-            else: state.last_sl_short = time.time()
-
-            dd_after_loss = (
-                (state.peak_capital - state.capital) / state.peak_capital
-                if state.peak_capital > 0 else 0.0
-            )
-            if DD_ALERT_YELLOW <= dd_after_loss < DD_STOP_TOTAL:
-                event_ts = int((last_1m_candle or {}).get("timestamp", 0) or 0)
-                if event_ts <= 0 and state.last_processed_market_ts_ms > 0:
-                    event_ts = int(state.last_processed_market_ts_ms // 1000)
-                if event_ts > 0:
-                    state.dd_last_loss_bar_ts = (event_ts // 300) * 300
-
-            _remove_position(pos)
+            if side == "long":  state.last_sl_long  = time.time()
+            else:               state.last_sl_short = time.time()
+            state.position = None
             save_state()
             acct_pct = pnl / CAPITAL * 100
-            log.info(f"❌ SL [{pos['setup']}] {pos['trade_id']} ${ep:.2f}→${exit_p:.2f} | "
+            log.info(f"❌ SL [{pos['setup']}] ${ep:.2f}→${exit_p:.2f} | "
                      f"{pnl:+.2f}$ ({acct_pct:+.1f}%) | Capital:${state.paper_balance:.2f} | "
-                     f"Slots:{len(state.positions)}/{MAX_POSITIONS}")
-            tg(f"❌ <b>SL — {pos['setup']}</b> {pos['trade_id']}\n"
-               f"${ep:.2f}→${exit_p:.2f} | {pnl:+.2f}$\n"
-               f"Capital: ${state.paper_balance:.2f}")
+                     f"Série:{state.consec_losses}")
+            tg(f"❌ <b>SL — {pos['setup']}</b>\n"
+               f"${ep:.2f}→${exit_p:.2f} | {pnl:+.2f}$ ({acct_pct:+.2f}%)\n"
+               f"Capital: ${state.paper_balance:.2f} | WR: {state.wr:.0f}%")
             notify_n8n(pos, "CLOSE_SL", pnl, "SL", "LOSS")
-            trades.append({"e": ep, "x": exit_p, "side": side, "pnl": pnl,
-                           "res": "SL", "setup": pos["setup"],
+            trades.append({"e": ep, "x": exit_p, "side": side,
+                           "pnl": pnl, "res": "SL", "setup": pos["setup"],
                            "date": datetime.now().strftime("%m/%d %H:%M")})
-            return True
+            return
 
         if tp1_hit:
+            # Fermeture partielle lot_tp1 (2/3)
             pnl_lot1 = _calc_pnl(side, ep, pos["tp1"], pos["lot_tp1"])
             state.paper_balance += pnl_lot1
-            state.paper_pnl += pnl_lot1
-            state.daily_pnl += pnl_lot1
-            state.consec_losses = 0
+            state.paper_pnl     += pnl_lot1
+            state.daily_pnl     += pnl_lot1
+            state.consec_losses  = 0  # TP1 = reset série perdante
+            # SL du lot restant remonté au TP1 (breakeven garanti)
             pos["tp1_hit"] = True
             pos["sl_lot2"] = pos["tp1"]
             save_state()
-            log.info(f"🟡 TP1 [{pos['setup']}] {pos['trade_id']} ${pos['tp1']:.2f} | "
+            log.info(f"🟡 TP1 [{pos['setup']}] ${pos['tp1']:.2f} | "
                      f"Lot1 {pos['lot_tp1']} fermé → +{pnl_lot1:.2f}$ | "
-                     f"Risque restant:{_position_open_risk_usd(pos):.2f}$")
-            tg(f"🟡 <b>TP1 — {pos['setup']}</b> {pos['trade_id']}\n"
-               f"${ep:.2f}→${pos['tp1']:.2f} | +{pnl_lot1:.2f}$\n"
-               f"SL Lot2 → ${pos['tp1']:.2f}")
+                     f"SL Lot2 → ${pos['tp1']:.2f} (breakeven) | "
+                     f"Capital:${state.paper_balance:.2f}")
+            tg(f"🟡 <b>TP1 — {pos['setup']}</b>\n"
+               f"${ep:.2f}→${pos['tp1']:.2f} | +{pnl_lot1:.2f}$ (lot {pos['lot_tp1']})\n"
+               f"SL Lot2 → ${pos['tp1']:.2f} | Capital: ${state.paper_balance:.2f}")
             notify_n8n(pos, "TP1_PARTIAL", pnl_lot1, "TP1", "TP1_WIN")
-            return True
+            return
 
+    # ── Phase 2 — TP1 atteint, lot_tp2 en cours ──────────────────
     else:
+        # En temps réel, ne jamais réutiliser le high/low de toute la minute après
+        # le passage de TP1 : ces extrêmes peuvent précéder l'activation du SL2.
+        # Le recovery REST demande explicitement les extrêmes via phase2_use_extremes.
         phase2_high = h if phase2_use_extremes else current_price
-        phase2_low = l if phase2_use_extremes else current_price
-        sl2_hit = (side == "long" and phase2_low <= pos["sl_lot2"]) or (side == "short" and phase2_high >= pos["sl_lot2"])
-        tp2_hit = (side == "long" and phase2_high >= pos["tp2"]) or (side == "short" and phase2_low <= pos["tp2"])
+        phase2_low  = l if phase2_use_extremes else current_price
+        sl2_hit = (side == "long"  and phase2_low  <= pos["sl_lot2"]) or \
+                  (side == "short" and phase2_high >= pos["sl_lot2"])
+        tp2_hit = (side == "long"  and phase2_high >= pos["tp2"]) or \
+                  (side == "short" and phase2_low  <= pos["tp2"])
 
         if sl2_hit:
-            exit_p = pos["sl_lot2"]
+            # SL lot2 touché au breakeven → gain nul sur ce lot
+            exit_p   = pos["sl_lot2"]
             pnl_lot2 = _calc_pnl(side, ep, exit_p, pos["lot_tp2"])
             state.paper_balance += pnl_lot2
-            state.paper_pnl += pnl_lot2
-            state.daily_pnl += pnl_lot2
-            state.wins += 1
-            state.daily_wins += 1
-            state.total_trades += 1
-            state.daily_trades += 1
-            _remove_position(pos)
+            state.paper_pnl     += pnl_lot2
+            state.daily_pnl     += pnl_lot2
+            state.wins          += 1  # TP1 atteint = WIN global
+            state.daily_wins    += 1
+            state.total_trades  += 1
+            state.daily_trades  += 1
+            state.position       = None
             save_state()
-            log.info(f"✅ TP1+BE [{pos['setup']}] {pos['trade_id']} | "
-                     f"Lot2 ${exit_p:.2f} | {pnl_lot2:+.2f}$ | Slots:{len(state.positions)}/{MAX_POSITIONS}")
-            tg(f"✅ <b>TP1+BE — {pos['setup']}</b> {pos['trade_id']}\n"
-               f"Lot2 clôturé ${exit_p:.2f} | Capital:${state.paper_balance:.2f}")
+            log.info(f"✅ TP1+BE [{pos['setup']}] | Lot2 BE ${exit_p:.2f} | "
+                     f"{pnl_lot2:+.2f}$ | Capital:${state.paper_balance:.2f}")
+            tg(f"✅ <b>TP1+BE — {pos['setup']}</b>\n"
+               f"Lot2 clôturé au breakeven ${exit_p:.2f}\n"
+               f"Capital: ${state.paper_balance:.2f} | WR: {state.wr:.0f}%")
             notify_n8n(pos, "CLOSE_TP1_BE", pnl_lot2, "TP2_BE", "WIN")
-            trades.append({"e": ep, "x": exit_p, "side": side, "pnl": pnl_lot2,
-                           "res": "TP1_BE", "setup": pos["setup"],
+            trades.append({"e": ep, "x": exit_p, "side": side,
+                           "pnl": pnl_lot2, "res": "TP1_BE", "setup": pos["setup"],
                            "date": datetime.now().strftime("%m/%d %H:%M")})
-            return True
+            return
 
         if tp2_hit:
+            # TP2 atteint — fermeture lot_tp2
             pnl_lot2 = _calc_pnl(side, ep, pos["tp2"], pos["lot_tp2"])
             state.paper_balance += pnl_lot2
-            state.paper_pnl += pnl_lot2
-            state.daily_pnl += pnl_lot2
-            state.wins += 1
-            state.daily_wins += 1
-            state.total_trades += 1
-            state.daily_trades += 1
-            _remove_position(pos)
+            state.paper_pnl     += pnl_lot2
+            state.daily_pnl     += pnl_lot2
+            state.wins          += 1
+            state.daily_wins    += 1
+            state.total_trades  += 1
+            state.daily_trades  += 1
+            state.position       = None
             save_state()
             acct_pct = pnl_lot2 / CAPITAL * 100
-            log.info(f"🎯 TP2 [{pos['setup']}] {pos['trade_id']} ${pos['tp2']:.2f} | "
-                     f"+{pnl_lot2:.2f}$ ({acct_pct:+.1f}%) | Slots:{len(state.positions)}/{MAX_POSITIONS}")
-            tg(f"🎯 <b>TP2 — {pos['setup']}</b> {pos['trade_id']}\n"
-               f"${ep:.2f}→${pos['tp2']:.2f} | +{pnl_lot2:.2f}$\n"
-               f"Capital:${state.paper_balance:.2f}")
+            log.info(f"🎯 TP2 [{pos['setup']}] ${pos['tp2']:.2f} | "
+                     f"+{pnl_lot2:.2f}$ ({acct_pct:+.1f}%) | "
+                     f"Capital:${state.paper_balance:.2f}")
+            tg(f"🎯 <b>TP2 — {pos['setup']}</b>\n"
+               f"${ep:.2f}→${pos['tp2']:.2f} | +{pnl_lot2:.2f}$ ({acct_pct:+.2f}%)\n"
+               f"Capital: ${state.paper_balance:.2f} | WR: {state.wr:.0f}%")
             notify_n8n(pos, "CLOSE_TP2", pnl_lot2, "TP2", "WIN_BOTH")
-            trades.append({"e": ep, "x": pos["tp2"], "side": side, "pnl": pnl_lot2,
-                           "res": "TP2", "setup": pos["setup"],
+            trades.append({"e": ep, "x": pos["tp2"], "side": side,
+                           "pnl": pnl_lot2, "res": "TP2", "setup": pos["setup"],
                            "date": datetime.now().strftime("%m/%d %H:%M")})
-            return True
-
-    return False
-
-
-def check_exits(current_price, last_1m_candle, *, phase2_use_extremes=False):
-    """Évalue indépendamment les sorties de toutes les positions ouvertes."""
-    for pos in list(state.positions):
-        # La position peut avoir été retirée lors d'un traitement précédent.
-        if state.get_position(pos.get("trade_id")) is None:
-            continue
-        _check_position_exit(
-            pos, current_price, last_1m_candle,
-            phase2_use_extremes=phase2_use_extremes,
-        )
+            return
 
 
 # ════════════════════════════════════════════════════════
@@ -1528,7 +1419,7 @@ def _shadow_register_closed_5m(
             shadow_payload = dict(shadow_signal)
             shadow_payload["shadow_level_source"] = level_source
             shadow_payload["shadow_dd_level"] = state.dd_level
-            shadow_payload["shadow_position_open"] = bool(state.positions)
+            shadow_payload["shadow_position_open"] = state.position is not None
 
             shadow.register_setup(
                 shadow_payload,
@@ -1538,12 +1429,16 @@ def _shadow_register_closed_5m(
                 bid=bid,
                 ask=ask,
                 live_price=live_price,
-                blocked_by_open_position=len(state.positions) >= MAX_POSITIONS,
+                blocked_by_open_position=state.position is not None,
                 open_position_side=(
-                    state.positions[0].get("side") if state.positions else None
+                    state.position.get("side")
+                    if isinstance(state.position, dict)
+                    else None
                 ),
                 open_position_trade_id=(
-                    state.positions[0].get("trade_id") if state.positions else None
+                    state.position.get("trade_id")
+                    if isinstance(state.position, dict)
+                    else None
                 ),
             )
 
@@ -1575,13 +1470,6 @@ def main():
         tg("🛑 <b>PERSISTANCE</b> — état principal et backup invalides/absents. Trading non démarré.")
         return
 
-    if int(MAX_POSITIONS) != EXPECTED_MAX_POSITIONS:
-        log.critical(
-            f"Démarrage refusé — config MAX_POSITIONS={MAX_POSITIONS}, attendu {EXPECTED_MAX_POSITIONS}"
-        )
-        tg(f"🛑 <b>CONFIG</b> — MAX_POSITIONS doit être {EXPECTED_MAX_POSITIONS}")
-        return
-
     if not WS_ENABLED:
         log.critical("WS staging désactivé : aucun fallback silencieux vers polling 1m/5m")
         tg("🛑 <b>WEBSOCKET CUTOVER</b> — WS_ENABLED=false, trading non démarré.")
@@ -1589,7 +1477,7 @@ def main():
 
     # Avant même d'ouvrir le transport WS, reconstruire les minutes clôturées
     # manquées si une position PAPER est restaurée.
-    if state.positions:
+    if state.position is not None:
         try:
             recover_open_position_closed_rest()
         except MarketRecoveryError as e:
@@ -1610,7 +1498,7 @@ def main():
         return
 
     # Handoff final REST -> WS : aucune décision/tick normal avant validation.
-    if state.positions:
+    if state.position is not None:
         try:
             recover_open_position_ws_handoff(ws_client)
         except MarketRecoveryError as e:
@@ -1735,7 +1623,7 @@ def main():
 
                 # Phase 1 peut utiliser les extrêmes de la 1m courante. Phase 2 utilise
                 # uniquement le prix live afin de ne pas recycler un low/high antérieur à TP1.
-                if state.positions:
+                if state.position:
                     check_exits(current_price, current_1m, phase2_use_extremes=False)
 
                 # Fermeture weekend reste prioritaire pour toute position restante.
@@ -1758,62 +1646,45 @@ def main():
 
                 signal = {"signal": None, "reason": "–"}
 
-                # Le marché est TOUJOURS analysé, même avec 1, 2 ou 3 positions ouvertes.
-                # DD/cooldown/slots ne bloquent que l'EXECUTION, jamais l'analyse.
+                # En PAPER exploration, check_drawdown() mesure le DD sans bloquer.
+                # En LIVE, il conserve le comportement de protection historique.
                 trading_allowed = check_drawdown()
-                risk_pct, score_malus = get_dd_params()
+                if trading_allowed and state.position is None:
+                    risk_pct, score_malus, _ = get_dd_params()
 
-                signal = calc_signal(
-                    candles_5m, candles_1m,
-                    candles_1h, candles_4h, candles_dxy,
-                    state.liq_map, state.ob_map,
-                    state.sweep_map, state.struct_map, state.dxy_map
-                )
-
-                if signal.get("signal"):
-                    signals = calc_signals(
+                    signal = calc_signal(
                         candles_5m, candles_1m,
                         candles_1h, candles_4h, candles_dxy,
                         state.liq_map, state.ob_map,
                         state.sweep_map, state.struct_map, state.dxy_map
                     )
-                    signal_bar_ts = int(candles_5m[-1].get("timestamp", 0) or 0)
 
-                    for idx, candidate in enumerate(signals):
-                        candidate["_signal_bar_ts"] = signal_bar_ts
-                        side_sig = candidate["signal"]
+                    if signal.get("signal"):
+                        side_sig = signal["signal"]
                         min_score_eff = MIN_SCORE + score_malus
-                        if candidate.get("score", 0) < min_score_eff:
-                            candidate["reason"] = f"DD N{state.dd_level} score {candidate['score']:.1f}<{min_score_eff:.1f}"
-                        elif not trading_allowed:
-                            candidate["reason"] = f"Signal détecté mais entrée bloquée DD/pause N{state.dd_level}"
-                        elif _dd_waits_for_new_5m_setup(candidate.get("_signal_bar_ts")):
-                            candidate["reason"] = (
-                                f"DD N{state.dd_level}: attente nouveau setup 5m "
-                                f"après barre SL {state.dd_last_loss_bar_ts}"
+                        if signal.get("score", 0) < min_score_eff:
+                            reason = (
+                                f"Score {signal['score']:.1f}<{min_score_eff:.1f}"
+                                if PAPER_MODE
+                                else f"DD N{state.dd_level} score {signal['score']:.1f}<{min_score_eff:.1f}"
                             )
+                            signal = {
+                                "signal": None,
+                                "reason": reason,
+                            }
                         elif state.cooldown_remaining(side_sig) > 0:
                             cd = state.cooldown_remaining(side_sig)
-                            candidate["reason"] = f"Cooldown {side_sig.upper()}: {int(cd/60)}m{int(cd%60):02d}s"
+                            signal = {
+                                "signal": None,
+                                "reason": f"Cooldown {side_sig.upper()}: {int(cd/60)}m{int(cd%60):02d}s",
+                            }
                         else:
-                            opened, open_reason = open_position(
-                                candidate, risk_pct, best_bid=best_bid, best_ask=best_ask
-                            )
-                            if not opened:
-                                candidate["reason"] = f"{candidate.get('reason','Signal')} | NON OUVERT: {open_reason}"
+                            open_position(signal, risk_pct)
 
-                        if idx == 0:
-                            signal = candidate
-
-                        if len(state.positions) >= MAX_POSITIONS:
-                            break
-
-                if state.positions:
-                    parts = []
-                    for pos in state.positions:
-                        ph = "Ph2" if pos["tp1_hit"] else "Ph1"
-                        parts.append(f"{pos['side'].upper()}[{pos['setup']}]@${pos['entry']:.1f} {ph}")
-                    pos_desc = f"{len(state.positions)}/{MAX_POSITIONS} | " + " ; ".join(parts)
+                if state.position:
+                    pos = state.position
+                    ph = "Ph2" if pos["tp1_hit"] else "Ph1"
+                    pos_desc = f"{pos['side'].upper()}[{pos['setup']}]@${pos['entry']:.1f} {ph}"
                 else:
                     pos_desc = "FLAT"
 
