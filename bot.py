@@ -1696,9 +1696,10 @@ def main():
                 )
 
                 current_1m = ws_client.get_current_candle("1m")
-                current_5m = ws_client.get_current_candle("5m")
                 candles_1m = _market_view(candles_1m_hist, current_1m, CANDLES_1M + 5)
-                candles_5m = _market_view(candles_5m_hist, current_5m, CANDLES_5M + 10)
+                # Entrées 5m : la stratégie reçoit uniquement l'historique clôturé.
+                # La bougie 5m en formation reste hors du moteur décisionnel.
+                candles_5m = list(candles_5m_hist[-(CANDLES_5M + 10):])
 
                 current_price = ws_client.get_live_price()
                 best_bid, best_ask = ws_client.get_best_bid_ask()
@@ -1752,30 +1753,35 @@ def main():
                     continue
 
                 now_mono = time.monotonic()
-                if now_mono < next_signal_eval:
+                # Une clôture 5m doit être traitée immédiatement et ne doit jamais
+                # être perdue à cause du throttle historique de 30 secondes.
+                if not closed_5m_events and now_mono < next_signal_eval:
                     time.sleep(WS_CONSUMER_SLEEP_SECONDS)
                     continue
                 next_signal_eval = now_mono + LOOP_SECONDS
 
-                # Les couches 1h/4h restent REST, à la cadence historique de la V4.
-                if now_mono >= next_htf_refresh:
+                # Les couches 1h/4h restent REST. Lors d'une clôture 5m, on force
+                # leur rafraîchissement avant l'évaluation du signal.
+                if closed_5m_events or now_mono >= next_htf_refresh:
                     candles_1h, candles_4h, candles_dxy = _fetch_htf_market_data()
                     refresh_htf_maps(candles_4h, candles_1h, candles_dxy)
                     next_htf_refresh = now_mono + LOOP_SECONDS
 
-                signal = {"signal": None, "reason": "–"}
+                signal = {"signal": None, "reason": "Attente clôture 5m"}
 
                 # Le marché est toujours analysé, même avec 1, 2 ou 3 positions ouvertes.
                 # En PAPER exploration, le DD reste informatif et ne bloque pas l'exécution.
                 trading_allowed = check_drawdown()
                 risk_pct, score_malus, _ = get_dd_params()
 
-                signal = calc_signal(
-                    candles_5m, candles_1m,
-                    candles_1h, candles_4h, candles_dxy,
-                    state.liq_map, state.ob_map,
-                    state.sweep_map, state.struct_map, state.dxy_map
-                )
+                # Nouvelle entrée uniquement à réception d'une clôture 5m réelle.
+                if closed_5m_events:
+                    signal = calc_signal(
+                        candles_5m, candles_1m,
+                        candles_1h, candles_4h, candles_dxy,
+                        state.liq_map, state.ob_map,
+                        state.sweep_map, state.struct_map, state.dxy_map
+                    )
 
                 if signal.get("signal"):
                     signals = calc_signals(
