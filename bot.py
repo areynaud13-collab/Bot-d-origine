@@ -1511,48 +1511,52 @@ def _shadow_register_closed_5m(
             # timestamp = début, donc dernier début admissible = bar_ts + 240.
             shadow_1m = _shadow_history_through(candles_1m_hist, bar_ts + 240)
 
-            shadow_signal = calc_signal(
+            shadow_signals = calc_signals(
                 shadow_5m, shadow_1m,
                 candles_1h, candles_4h, candles_dxy,
                 state.liq_map, state.ob_map,
                 state.sweep_map, state.struct_map, state.dxy_map,
             )
 
-            if not shadow_signal.get("signal"):
+            if not shadow_signals:
                 continue
 
-            level_price, level_source = _shadow_level_from_signal(shadow_signal)
-            if level_price is None:
-                log.warning(
-                    "SHADOW SKIP | %s %s | niveau non résolu (%s)",
-                    str(shadow_signal.get("signal", "?")).upper(),
-                    shadow_signal.get("setup", "UNKNOWN"),
-                    level_source,
+            for shadow_signal in shadow_signals:
+                if not shadow_signal.get("signal"):
+                    continue
+
+                level_price, level_source = _shadow_level_from_signal(shadow_signal)
+                if level_price is None:
+                    log.warning(
+                        "SHADOW SKIP | %s %s | niveau non résolu (%s)",
+                        str(shadow_signal.get("signal", "?")).upper(),
+                        shadow_signal.get("setup", "UNKNOWN"),
+                        level_source,
+                    )
+                    continue
+
+                # Contexte analytique uniquement : n'influence aucun filtre du bot.
+                shadow_payload = dict(shadow_signal)
+                shadow_payload["shadow_level_source"] = level_source
+                shadow_payload["shadow_dd_level"] = state.dd_level
+                shadow_payload["shadow_position_open"] = bool(state.positions)
+
+                shadow.register_setup(
+                    shadow_payload,
+                    level_price=level_price,
+                    validated_at=bar_ts + 300,
+                    signal_bar_ts=bar_ts,
+                    bid=bid,
+                    ask=ask,
+                    live_price=live_price,
+                    blocked_by_open_position=len(state.positions) >= MAX_POSITIONS,
+                    open_position_side=(
+                        state.positions[0].get("side") if state.positions else None
+                    ),
+                    open_position_trade_id=(
+                        state.positions[0].get("trade_id") if state.positions else None
+                    ),
                 )
-                continue
-
-            # Contexte analytique uniquement : n'influence aucun filtre du bot.
-            shadow_payload = dict(shadow_signal)
-            shadow_payload["shadow_level_source"] = level_source
-            shadow_payload["shadow_dd_level"] = state.dd_level
-            shadow_payload["shadow_position_open"] = bool(state.positions)
-
-            shadow.register_setup(
-                shadow_payload,
-                level_price=level_price,
-                validated_at=bar_ts + 300,
-                signal_bar_ts=bar_ts,
-                bid=bid,
-                ask=ask,
-                live_price=live_price,
-                blocked_by_open_position=len(state.positions) >= MAX_POSITIONS,
-                open_position_side=(
-                    state.positions[0].get("side") if state.positions else None
-                ),
-                open_position_trade_id=(
-                    state.positions[0].get("trade_id") if state.positions else None
-                ),
-            )
 
     except Exception as exc:
         log.warning("SHADOW 13A | calcul 5m ignoré: %s", exc, exc_info=True)
