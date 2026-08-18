@@ -1029,9 +1029,10 @@ def _calc_signal_candidates(candles_5m, candles_1m,
     opens   = [c["open"]   for c in candles_5m]
     volumes = [c["volume"] for c in candles_5m]
 
-    i = len(candles_5m) - 1  # bougie courante
-    ts_now = candles_5m[i].get("timestamp", 0)
-    hour   = datetime.fromtimestamp(ts_now, tz=timezone.utc).hour if ts_now else 0
+    i = len(candles_5m) - 1  # dernière bougie 5m clôturée fournie par bot.py
+    signal_bar_ts = candles_5m[i].get("timestamp", 0)
+    ts_now = signal_bar_ts + 300 if signal_bar_ts else 0
+    hour   = datetime.fromtimestamp(signal_bar_ts, tz=timezone.utc).hour if signal_bar_ts else 0
 
     # ── Indicateurs 5m ───────────────────────────────────────────
     atr_arr = calc_atr(highs, lows, closes, ATR_PERIOD)
